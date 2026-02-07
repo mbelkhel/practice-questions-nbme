@@ -1,8 +1,30 @@
 const fs = require('fs/promises');
 const path = require('path');
-const mammoth = require('mammoth');
-const pdfParse = require('pdf-parse');
-const WordExtractor = require('word-extractor');
+
+let mammothLib = null;
+let pdfParseLib = null;
+let wordExtractorLib = null;
+
+function getMammoth() {
+  if (!mammothLib) {
+    mammothLib = require('mammoth');
+  }
+  return mammothLib;
+}
+
+function getPdfParse() {
+  if (!pdfParseLib) {
+    pdfParseLib = require('pdf-parse');
+  }
+  return pdfParseLib;
+}
+
+function getWordExtractorClass() {
+  if (!wordExtractorLib) {
+    wordExtractorLib = require('word-extractor');
+  }
+  return wordExtractorLib;
+}
 
 function normalizeWhitespace(text) {
   return text
@@ -35,12 +57,14 @@ function htmlToTextWithImageMarkers(html) {
 }
 
 async function extractFromPdf(filePath) {
+  const pdfParse = getPdfParse();
   const buffer = await fs.readFile(filePath);
   const parsed = await pdfParse(buffer);
   return normalizeWhitespace(parsed.text || '');
 }
 
 async function extractFromDocx(filePath) {
+  const mammoth = getMammoth();
   const [rawResult, htmlResult] = await Promise.all([
     mammoth.extractRawText({ path: filePath }),
     mammoth.convertToHtml({
@@ -69,6 +93,7 @@ async function extractFromDocx(filePath) {
 }
 
 async function extractFromDoc(filePath) {
+  const WordExtractor = getWordExtractorClass();
   const extractor = new WordExtractor();
   const extracted = await extractor.extract(filePath);
   return normalizeWhitespace(extracted.getBody() || '');
