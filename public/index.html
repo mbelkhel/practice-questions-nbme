@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NBME Quiz Builder</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="upload-card" id="upload-section">
+        <h1>NBME-Style Quiz Builder</h1>
+        <p class="upload-subtitle">
+          Upload <code>.pdf</code>, <code>.docx</code>, <code>.doc</code>, <code>.txt</code>, or <code>.md</code>.
+          Timed mode is automatically <strong>90 seconds per question</strong>.
+        </p>
+
+        <form id="upload-form" class="upload-form">
+          <label class="file-input-wrap">
+            <span>Question Bank File</span>
+            <input id="document-input" name="document" type="file" accept=".pdf,.docx,.doc,.txt,.md" required />
+          </label>
+
+          <div class="mode-grid">
+            <label class="toggle-row">
+              <input id="timed-mode" name="timedMode" type="checkbox" />
+              <span>Timed Mode (auto 1.5 min/question)</span>
+            </label>
+            <label class="toggle-row">
+              <input id="tutor-mode" name="tutorMode" type="checkbox" checked />
+              <span>Tutor Mode</span>
+            </label>
+            <label class="toggle-row">
+              <input id="use-gemini" name="useGemini" type="checkbox" />
+              <span>Use Gemini for missing explanations</span>
+            </label>
+          </div>
+
+          <p class="usage-note">
+            Interactions: drag text to highlight, click highlight to remove, click answer text to strike, click circle to select.
+          </p>
+
+          <button id="upload-btn" type="submit" class="primary-btn">Generate Quiz</button>
+        </form>
+
+        <div id="upload-status" class="status"></div>
+      </section>
+
+      <section id="quiz-section" class="quiz-shell hidden">
+        <header class="exam-topbar">
+          <div class="top-left">
+            <p id="exam-item" class="exam-item">Exam Section 1: Item 1 of 1</p>
+            <button id="flag-btn" class="mark-btn" type="button">Mark</button>
+          </div>
+
+          <div class="top-center">
+            <p class="exam-brand">National Board of Medical Examiners Style</p>
+            <h2 id="quiz-title">Generated Quiz</h2>
+          </div>
+
+          <div class="top-right">
+            <p id="timer-label" class="timer-label">Untimed Mode</p>
+            <div id="timer" class="timer">--:--</div>
+          </div>
+        </header>
+
+        <div class="exam-main">
+          <section class="question-stage">
+            <div class="question-header">
+              <p id="q-number" class="q-number">1.</p>
+              <p id="q-counter" class="q-counter">Item 1 of 1</p>
+            </div>
+
+            <article id="stem" class="stem" tabindex="0"></article>
+            <div id="question-images" class="question-images"></div>
+            <div id="options" class="options"></div>
+            <div class="submit-wrap">
+              <button id="submit-answer-btn" type="button" class="submit-answer-btn hidden">Submit Answer</button>
+            </div>
+            <section id="explanation" class="explanation hidden"></section>
+          </section>
+
+          <aside class="navigator">
+            <div class="nav-block">
+              <p class="nav-label">Mode</p>
+              <div class="chip-row">
+                <span id="chip-timed" class="chip">Timed Off</span>
+                <span id="chip-tutor" class="chip">Tutor On</span>
+              </div>
+            </div>
+
+            <div class="nav-block">
+              <p class="nav-label">Progress</p>
+              <p id="progress-label" class="progress-label">0 / 0 answered</p>
+              <div id="palette" class="palette"></div>
+            </div>
+
+            <div class="nav-block legend">
+              <p class="nav-label">Legend</p>
+              <p><span class="dot current"></span>Current</p>
+              <p><span class="dot answered"></span>Answered</p>
+              <p><span class="dot wrong"></span>Wrong</p>
+              <p><span class="dot flagged"></span>Flagged</p>
+              <p><span class="dot pending"></span>Unanswered</p>
+            </div>
+          </aside>
+        </div>
+
+        <footer class="exam-bottombar">
+          <div class="bottom-left">
+            <button id="prev-btn" class="nav-btn" type="button">Previous</button>
+            <button id="next-btn" class="nav-btn" type="button">Next</button>
+            <button id="finish-btn" class="nav-btn" type="button">End Block</button>
+          </div>
+
+          <div class="bottom-right">
+            <span class="stopwatch-label">Stopwatch</span>
+            <span id="stopwatch" class="stopwatch">00:00</span>
+          </div>
+        </footer>
+      </section>
+
+      <section id="summary" class="summary hidden"></section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
