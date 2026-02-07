@@ -74,26 +74,72 @@ function buildModelChain(options = {}) {
   return unique;
 }
 
-function isRateLimitError(error) {
-  const pieces = [
+function errorText(error) {
+  return [
     error?.code,
     error?.status,
     error?.error?.status,
     error?.message,
     error?.error?.message,
     error?.details,
+    error?.error?.details,
   ]
     .filter(Boolean)
-    .map((value) => String(value).toLowerCase());
+    .map((value) => String(value).toLowerCase())
+    .join(' | ');
+}
 
-  return pieces.some((value) => {
-    return (
-      value.includes('429') ||
-      value.includes('resource_exhausted') ||
-      value.includes('rate limit') ||
-      value.includes('quota')
-    );
-  });
+function isRateLimitError(error) {
+  const text = errorText(error);
+  return (
+    text.includes('429') ||
+    text.includes('resource_exhausted') ||
+    text.includes('rate limit') ||
+    text.includes('quota')
+  );
+}
+
+function isAuthError(error) {
+  const text = errorText(error);
+  return (
+    text.includes('401') ||
+    text.includes('unauthenticated') ||
+    text.includes('invalid api key') ||
+    text.includes('api key not valid')
+  );
+}
+
+function isJsonModeUnsupportedError(error) {
+  const text = errorText(error);
+  return (
+    (text.includes('invalid_argument') || text.includes('400') || text.includes('bad request')) &&
+    (text.includes('responsemimetype') || text.includes('response mime') || text.includes('application/json'))
+  );
+}
+
+function isFallbackCandidateError(error) {
+  if (isRateLimitError(error) || isAuthError(error)) {
+    return true;
+  }
+
+  const text = errorText(error);
+  return (
+    text.includes('404') ||
+    text.includes('model not found') ||
+    text.includes('unsupported model') ||
+    text.includes('not found') ||
+    text.includes('403') ||
+    text.includes('permission_denied') ||
+    text.includes('503') ||
+    text.includes('500') ||
+    text.includes('unavailable') ||
+    text.includes('overloaded') ||
+    text.includes('internal') ||
+    text.includes('timeout') ||
+    text.includes('timed out') ||
+    text.includes('fetch failed') ||
+    text.includes('network')
+  );
 }
 
 function normalizeOptionLabels(value) {
@@ -224,15 +270,30 @@ async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
 
   let response;
   try {
-    response = await ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        temperature: 0.2,
-        abortSignal: controller.signal,
-      },
-    });
+    try {
+      response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          temperature: 0.2,
+          abortSignal: controller.signal,
+        },
+      });
+    } catch (jsonModeError) {
+      if (!isJsonModeUnsupportedError(jsonModeError)) {
+        throw jsonModeError;
+      }
+
+      response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          temperature: 0.2,
+          abortSignal: controller.signal,
+        },
+      });
+    }
   } catch (error) {
     if (controller.signal.aborted) {
       const timeoutError = new Error(`Gemini chunk timed out after ${timeoutMs}ms.`);
@@ -244,6 +305,16 @@ async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
       rateLimitError.code = 'GEMINI_RATE_LIMIT';
       throw rateLimitError;
     }
+    if (isAuthError(error)) {
+      const authError = new Error('Gemini authentication failed.');
+      authError.code = 'GEMINI_AUTH';
+      throw authError;
+    }
+    if (isFallbackCandidateError(error)) {
+      const modelError = new Error('Gemini model call failed.');
+      modelError.code = 'GEMINI_MODEL_ERROR';
+      throw modelError;
+    }
     throw error;
   } finally {
     clearTimeout(timer);
@@ -252,7 +323,9 @@ async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
   const parsed = extractJson(response.text);
 
   if (!Array.isArray(parsed)) {
-    throw new Error('Gemini returned non-JSON output.');
+    const outputError = new Error('Gemini returned non-JSON output.');
+    outputError.code = 'GEMINI_MODEL_ERROR';
+    throw outputError;
   }
 
   return parsed;
@@ -304,9 +377,12 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
   let processedQuestions = 0;
   let timedOut = false;
   let exhaustedModels = false;
+  let authFailed = false;
   let modelIndex = 0;
   let activeModel = initialModel;
   let fallbackCount = 0;
+  let rateLimitFallbackCount = 0;
+  let modelErrorFallbackCount = 0;
   const triedModels = [activeModel];
   const startedAt = Date.now();
 
@@ -353,7 +429,19 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
           break chunkLoop;
         }
 
-        if (error && error.code === 'GEMINI_RATE_LIMIT' && modelIndex < models.length - 1) {
+        const canFallback = modelIndex < models.length - 1;
+        const shouldFallback =
+          error &&
+          (error.code === 'GEMINI_RATE_LIMIT' ||
+            error.code === 'GEMINI_MODEL_ERROR' ||
+            (error.code !== 'GEMINI_AUTH' && isFallbackCandidateError(error)));
+
+        if (shouldFallback && canFallback) {
+          if (error.code === 'GEMINI_RATE_LIMIT') {
+            rateLimitFallbackCount += 1;
+          } else {
+            modelErrorFallbackCount += 1;
+          }
           modelIndex += 1;
           fallbackCount += 1;
           const nextModel = models[modelIndex];
@@ -363,7 +451,13 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
           continue;
         }
 
-        if (error && error.code === 'GEMINI_RATE_LIMIT' && modelIndex >= models.length - 1) {
+        if (error && error.code === 'GEMINI_AUTH') {
+          failures += 1;
+          authFailed = true;
+          break chunkLoop;
+        }
+
+        if (shouldFallback && !canFallback) {
           failures += 1;
           exhaustedModels = true;
           break chunkLoop;
@@ -383,10 +477,19 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
     reasonParts.push('Stopped early due to runtime budget.');
   }
   if (fallbackCount > 0) {
-    reasonParts.push(`Rate-limit fallback used ${fallbackCount} time(s); active model: ${activeModel}.`);
+    reasonParts.push(`Fallback switched models ${fallbackCount} time(s); active model: ${activeModel}.`);
+  }
+  if (rateLimitFallbackCount > 0) {
+    reasonParts.push(`Rate-limit fallbacks: ${rateLimitFallbackCount}.`);
+  }
+  if (modelErrorFallbackCount > 0) {
+    reasonParts.push(`Model-error fallbacks: ${modelErrorFallbackCount}.`);
+  }
+  if (authFailed) {
+    reasonParts.push('Gemini authentication failed.');
   }
   if (exhaustedModels) {
-    reasonParts.push('All fallback models were rate-limited.');
+    reasonParts.push('All fallback models failed or were unavailable.');
   }
   if (failures > 0) {
     reasonParts.push(`${failures} chunk(s) failed.`);
@@ -397,7 +500,9 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
     model: activeModel,
     modelChain: models,
     triedModels,
-    rateLimitFallbacks: fallbackCount,
+    rateLimitFallbacks: rateLimitFallbackCount,
+    rateLimitFallbackCount,
+    modelErrorFallbackCount,
     updatedQuestions,
     failedChunks: failures,
     processedQuestions,

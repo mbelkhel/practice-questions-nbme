@@ -480,9 +480,13 @@ function parseUnnumberedQuestionBlocks(questionSection) {
   const questions = [];
   let cursor = 0;
   let number = 1;
+  let pendingImageLines = [];
 
   while (cursor < lines.length) {
     while (cursor < lines.length && !isLikelyQuestionStartLine(lines[cursor])) {
+      if (isImageMarkerLine(lines[cursor])) {
+        pendingImageLines.push(lines[cursor]);
+      }
       cursor += 1;
     }
 
@@ -490,7 +494,8 @@ function parseUnnumberedQuestionBlocks(questionSection) {
       break;
     }
 
-    const stemLines = [lines[cursor]];
+    const stemLines = [...pendingImageLines, lines[cursor]];
+    pendingImageLines = [];
     cursor += 1;
 
     while (cursor < lines.length) {
@@ -519,6 +524,12 @@ function parseUnnumberedQuestionBlocks(questionSection) {
       const nextLine = lines[cursor];
 
       if (isImageMarkerLine(nextLine)) {
+        // Images encountered after answer choices usually belong to the following question.
+        if (optionLines.length >= 2) {
+          pendingImageLines.push(nextLine);
+          cursor += 1;
+          break;
+        }
         stemLines.push(nextLine);
         cursor += 1;
         continue;
