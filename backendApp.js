@@ -62,7 +62,7 @@ const upload = multer({
   },
 });
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '4mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -72,6 +72,75 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
   });
 });
+
+async function buildQuizResponseFromText(text, requestBody, fileName = '') {
+  if (!text || text.trim().length < 30) {
+    return {
+      error: 'The uploaded file appears empty or unreadable.',
+      status: 400,
+    };
+  }
+
+  const quiz = buildQuizFromText(text);
+
+  if (!quiz.questions.length) {
+    return {
+      error: 'No valid multiple-choice questions were detected. Check document format (Question N + answer choices).',
+      status: 400,
+    };
+  }
+
+  const useGemini = toBool(requestBody?.useGemini, false);
+  let gemini = {
+    attempted: false,
+    updatedQuestions: 0,
+    reason: 'Disabled by request.',
+  };
+
+  if (useGemini) {
+    gemini = await enrichQuestionsWithGemini(quiz.questions, {
+      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+    });
+  }
+
+  for (const question of quiz.questions) {
+    for (const option of question.options) {
+      if (!question.explanations[option.label] || question.explanations[option.label].trim().length < 5) {
+        if (question.sourceExplanation) {
+          question.explanations[option.label] = question.sourceExplanation;
+          if (question.explanationSource === 'none') {
+            question.explanationSource = 'document';
+          }
+        } else {
+          question.explanations[option.label] =
+            'Explanation not available in source. Enable Gemini with a valid API key to auto-generate rationale.';
+        }
+      }
+    }
+  }
+
+  const tutorModeDefault = toBool(requestBody?.tutorMode, true);
+  const timedModeDefault = toBool(requestBody?.timedMode, false);
+  const timedSecondsPerQuestion = 90;
+
+  return {
+    status: 200,
+    payload: {
+      quiz,
+      processing: {
+        fileName,
+        parsing: quiz.parsing,
+        gemini,
+      },
+      defaults: {
+        tutorMode: tutorModeDefault,
+        timedMode: timedModeDefault,
+        timedSecondsPerQuestion,
+        timedSecondsTotal: quiz.questions.length * timedSecondsPerQuestion,
+      },
+    },
+  };
+}
 
 app.post('/api/quiz/upload', upload.single('document'), async (req, res) => {
   let uploadedPath = null;
@@ -85,66 +154,13 @@ app.post('/api/quiz/upload', upload.single('document'), async (req, res) => {
     uploadedPath = req.file.path;
 
     const text = await extractTextFromDocument(uploadedPath, req.file.originalname);
-    if (!text || text.trim().length < 30) {
-      res.status(400).json({ error: 'The uploaded file appears empty or unreadable.' });
+    const result = await buildQuizResponseFromText(text, req.body, req.file.originalname);
+    if (result.error) {
+      res.status(result.status || 400).json({ error: result.error });
       return;
     }
 
-    const quiz = buildQuizFromText(text);
-
-    if (!quiz.questions.length) {
-      res.status(400).json({
-        error: 'No valid multiple-choice questions were detected. Check document format (Question N + answer choices).',
-      });
-      return;
-    }
-
-    const useGemini = toBool(req.body.useGemini, false);
-    let gemini = {
-      attempted: false,
-      updatedQuestions: 0,
-      reason: 'Disabled by request.',
-    };
-
-    if (useGemini) {
-      gemini = await enrichQuestionsWithGemini(quiz.questions, {
-        model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
-      });
-    }
-
-    for (const question of quiz.questions) {
-      for (const option of question.options) {
-        if (!question.explanations[option.label] || question.explanations[option.label].trim().length < 5) {
-          if (question.sourceExplanation) {
-            question.explanations[option.label] = question.sourceExplanation;
-            if (question.explanationSource === 'none') {
-              question.explanationSource = 'document';
-            }
-          } else {
-            question.explanations[option.label] = 'Explanation not available in source. Enable Gemini with a valid API key to auto-generate rationale.';
-          }
-        }
-      }
-    }
-
-    const tutorModeDefault = toBool(req.body.tutorMode, true);
-    const timedModeDefault = toBool(req.body.timedMode, false);
-    const timedSecondsPerQuestion = 90;
-
-    res.json({
-      quiz,
-      processing: {
-        fileName: req.file.originalname,
-        parsing: quiz.parsing,
-        gemini,
-      },
-      defaults: {
-        tutorMode: tutorModeDefault,
-        timedMode: timedModeDefault,
-        timedSecondsPerQuestion,
-        timedSecondsTotal: quiz.questions.length * timedSecondsPerQuestion,
-      },
-    });
+    res.json(result.payload);
   } catch (error) {
     res.status(500).json({
       error: error.message || 'Failed to process document.',
@@ -157,6 +173,25 @@ app.post('/api/quiz/upload', upload.single('document'), async (req, res) => {
         // No-op: upload cleanup should not fail the request.
       }
     }
+  }
+});
+
+app.post('/api/quiz/from-text', async (req, res) => {
+  try {
+    const text = String(req.body?.text || '');
+    const fileName = String(req.body?.fileName || 'document');
+    const result = await buildQuizResponseFromText(text, req.body, fileName);
+
+    if (result.error) {
+      res.status(result.status || 400).json({ error: result.error });
+      return;
+    }
+
+    res.json(result.payload);
+  } catch (error) {
+    res.status(500).json({
+      error: error.message || 'Failed to process text payload.',
+    });
   }
 });
 

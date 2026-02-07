@@ -23,6 +23,8 @@ const dom = {
   uploadStatus: document.getElementById('upload-status'),
   quizSection: document.getElementById('quiz-section'),
   quizTitle: document.getElementById('quiz-title'),
+  topPrevBtn: document.getElementById('top-prev-btn'),
+  topNextBtn: document.getElementById('top-next-btn'),
   examItem: document.getElementById('exam-item'),
   timerLabel: document.getElementById('timer-label'),
   timer: document.getElementById('timer'),
@@ -62,6 +64,7 @@ const state = {
   completed: false,
   completionReason: '',
   processing: null,
+  localImageMap: {},
 };
 
 function escapeHtml(value) {
@@ -115,6 +118,16 @@ function extensionOf(fileName) {
 
 function canCompressDocx(file) {
   return extensionOf(file?.name) === '.docx';
+}
+
+function clearLocalImageMap() {
+  const urls = new Set(Object.values(state.localImageMap || {}));
+  for (const url of urls) {
+    if (typeof url === 'string' && /^blob:/i.test(url)) {
+      URL.revokeObjectURL(url);
+    }
+  }
+  state.localImageMap = {};
 }
 
 function currentQuestion() {
@@ -281,6 +294,17 @@ function safeImageSrc(src) {
   const trimmed = String(src || '').trim();
   if (!trimmed) {
     return '';
+  }
+
+  const byExact = state.localImageMap?.[trimmed];
+  if (byExact) {
+    return byExact;
+  }
+
+  const lowered = trimmed.toLowerCase();
+  const byLower = state.localImageMap?.[lowered];
+  if (byLower) {
+    return byLower;
   }
 
   if (/^data:image\//i.test(trimmed)) {
@@ -531,7 +555,9 @@ function renderQuestion() {
 
   const atLastQuestion = state.currentIndex === state.quiz.questions.length - 1;
   dom.prevBtn.disabled = state.currentIndex === 0;
+  dom.topPrevBtn.disabled = state.currentIndex === 0;
   dom.nextBtn.disabled = atLastQuestion;
+  dom.topNextBtn.disabled = atLastQuestion;
   dom.nextBtn.textContent = 'Next';
   dom.finishBtn.classList.toggle('hidden', state.completed);
   dom.newTestBtn.classList.toggle('hidden', !state.completed);
@@ -636,6 +662,7 @@ function completeQuiz(reason = '') {
 
 function resetToUploadScreen() {
   stopClock();
+  clearLocalImageMap();
   state.quiz = null;
   state.currentIndex = 0;
   state.answers = {};
@@ -667,16 +694,19 @@ function docxImageMimeType(entryName) {
   if (/\.png$/i.test(entryName)) {
     return 'image/png';
   }
+  if (/\.gif$/i.test(entryName)) {
+    return 'image/gif';
+  }
+  if (/\.bmp$/i.test(entryName)) {
+    return 'image/bmp';
+  }
+  if (/\.svg$/i.test(entryName)) {
+    return 'image/svg+xml';
+  }
   if (/\.webp$/i.test(entryName)) {
     return 'image/webp';
   }
   return 'image/jpeg';
-}
-
-function baseNameWithoutExtension(fileName) {
-  const name = String(fileName || 'document').trim();
-  const dot = name.lastIndexOf('.');
-  return (dot > 0 ? name.slice(0, dot) : name).replace(/[^\w.-]+/g, '_').slice(0, 90) || 'document';
 }
 
 function decodeXmlEntities(text) {
@@ -698,52 +728,131 @@ function normalizeFallbackText(text) {
     .trim();
 }
 
-async function extractDocxTextFallbackFile(file) {
-  if (typeof window.JSZip === 'undefined') {
-    throw new Error('Compression library unavailable in browser.');
-  }
+function normalizeDocxTargetPath(target) {
+  const parts = String(target || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean);
 
-  const zip = await window.JSZip.loadAsync(await file.arrayBuffer());
-  const xmlEntries = Object.keys(zip.files).filter((entryName) =>
-    /^word\/(?:document|header\d+|footer\d+|footnotes|endnotes)\.xml$/i.test(entryName),
-  );
-
-  if (!xmlEntries.length) {
-    throw new Error('Unable to read text from DOCX fallback.');
-  }
-
-  const chunks = [];
-
-  for (const entryName of xmlEntries) {
-    const entry = zip.file(entryName);
-    if (!entry) {
+  const stack = [];
+  for (const part of parts) {
+    if (part === '.') {
       continue;
     }
+    if (part === '..') {
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+  }
 
-    const xml = await entry.async('string');
-    const text = decodeXmlEntities(
-      xml
+  return stack.join('/');
+}
+
+function parseDocxRelationships(xml) {
+  const relMap = {};
+  if (!xml) {
+    return relMap;
+  }
+
+  const regex = /<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"[^>]*>/gi;
+  let match = regex.exec(xml);
+
+  while (match) {
+    const relId = match[1];
+    const target = normalizeDocxTargetPath(match[2]);
+    if (relId && target) {
+      relMap[relId] = target;
+    }
+    match = regex.exec(xml);
+  }
+
+  return relMap;
+}
+
+function insertDocxImageMarkers(xml, relMap) {
+  return String(xml || '').replace(/<w:drawing[\s\S]*?<\/w:drawing>/gi, (drawingXml) => {
+    const relMatch = drawingXml.match(/\br:embed="([^"]+)"/i) || drawingXml.match(/\br:link="([^"]+)"/i);
+    if (!relMatch) {
+      return '\n';
+    }
+
+    const target = relMap[relMatch[1]] || '';
+    const fileName = target.split('/').pop();
+    if (!fileName) {
+      return '\n';
+    }
+
+    return `\n[IMAGE:${fileName}]\n`;
+  });
+}
+
+function xmlToNormalizedDocxText(xml) {
+  return normalizeFallbackText(
+    decodeXmlEntities(
+      String(xml || '')
         .replace(/<w:tab\/>/gi, '\t')
         .replace(/<w:br[^>]*\/>/gi, '\n')
         .replace(/<\/w:p>/gi, '\n')
         .replace(/<\/w:tr>/gi, '\n')
         .replace(/<[^>]+>/g, ''),
-    );
+    ),
+  );
+}
 
-    if (text.trim()) {
-      chunks.push(text);
+async function buildDocxLocalImageMap(zip) {
+  const imageMap = {};
+  const mediaEntries = Object.keys(zip.files).filter((entryName) =>
+    /^word\/media\/.+\.(jpe?g|png|gif|webp|bmp|svg)$/i.test(entryName),
+  );
+
+  for (const entryName of mediaEntries) {
+    const entry = zip.file(entryName);
+    if (!entry) {
+      continue;
     }
+
+    const bytes = await entry.async('uint8array');
+    const fileName = entryName.split('/').pop();
+    if (!fileName || !bytes.length) {
+      continue;
+    }
+
+    const url = URL.createObjectURL(new Blob([bytes], { type: docxImageMimeType(entryName) }));
+    imageMap[fileName] = url;
+    imageMap[fileName.toLowerCase()] = url;
+    imageMap[entryName] = url;
+    imageMap[entryName.toLowerCase()] = url;
+    imageMap[`media/${fileName}`] = url;
+    imageMap[`media/${fileName}`.toLowerCase()] = url;
   }
 
-  const mergedText = normalizeFallbackText(chunks.join('\n\n'));
-  if (!mergedText) {
-    throw new Error('Could not extract text from DOCX fallback.');
+  return imageMap;
+}
+
+async function extractLargeDocxPayload(file) {
+  if (typeof window.JSZip === 'undefined') {
+    throw new Error('Compression library unavailable in browser.');
   }
 
-  return new File([mergedText], `${baseNameWithoutExtension(file.name)}-text-only.txt`, {
-    type: 'text/plain',
-    lastModified: Date.now(),
-  });
+  const zip = await window.JSZip.loadAsync(await file.arrayBuffer());
+  const documentEntry = zip.file('word/document.xml');
+  if (!documentEntry) {
+    throw new Error('Unable to read DOCX body XML.');
+  }
+
+  const relationshipsXml = (await zip.file('word/_rels/document.xml.rels')?.async('string')) || '';
+  const relMap = parseDocxRelationships(relationshipsXml);
+  const documentXml = await documentEntry.async('string');
+  const withImageMarkers = insertDocxImageMarkers(documentXml, relMap);
+  const text = xmlToNormalizedDocxText(withImageMarkers);
+  const imageMap = await buildDocxLocalImageMap(zip);
+
+  if (!text) {
+    throw new Error('Could not extract text from DOCX.');
+  }
+
+  return { text, imageMap };
 }
 
 async function compressImageBytes(uint8Array, mimeType, options = {}) {
@@ -914,27 +1023,50 @@ async function prepareUploadFile(rawFile) {
     }
   }
 
-  setStatus(
-    `Compressed file is still ${formatFileSize(
-      candidate.size,
-    )}. Switching to text-only fallback to fit Vercel limits (images will be skipped).`,
-  );
-
-  const textFallback = await extractDocxTextFallbackFile(rawFile);
-  if (textFallback.size <= SERVER_UPLOAD_LIMIT_BYTES) {
-    return {
-      file: textFallback,
-      note: `The original DOCX remained too large for Vercel with embedded images. Uploaded a text-only fallback (${formatFileSize(
-        textFallback.size,
-      )}) so parsing can continue. Split the source into smaller docs if you need all images preserved.`,
-    };
-  }
-
   throw new Error(
-    `File is still too large even after aggressive compression and text fallback. Size is ${formatFileSize(
-      rawFile.size,
-    )}. Split the file into multiple smaller documents and upload one at a time.`,
+    `File is still too large after aggressive compression (${formatFileSize(
+      candidate.size,
+    )}). Try again and the app will use a large-DOCX local extraction path that preserves image references.`,
   );
+}
+
+async function parseResponseBody(response) {
+  const rawBody = await response.text();
+  let body = {};
+  if (rawBody) {
+    try {
+      body = JSON.parse(rawBody);
+    } catch (error) {
+      if (/<!doctype html|<html/i.test(rawBody)) {
+        throw new Error('Server returned a non-JSON error page. Check deployment logs and retry.');
+      }
+      throw new Error(rawBody.slice(0, 240));
+    }
+  }
+  return body;
+}
+
+function applyQuizToState(body, localImageMap = {}) {
+  state.quiz = body.quiz;
+  state.currentIndex = 0;
+  state.answers = {};
+  state.selections = {};
+  state.submittedTutor = {};
+  state.flagged = new Set();
+  state.struck = {};
+  state.completed = false;
+  state.completionReason = '';
+  state.processing = body.processing;
+  state.localImageMap = localImageMap || {};
+
+  state.timedMode = dom.timedMode.checked;
+  state.tutorMode = dom.tutorMode.checked;
+
+  dom.uploadSection.classList.add('hidden');
+  dom.quizSection.classList.remove('hidden');
+  dom.summary.classList.add('hidden');
+
+  startClock();
 }
 
 async function uploadDocument(event) {
@@ -948,11 +1080,56 @@ async function uploadDocument(event) {
 
   let uploadFile = selectedFile;
   let uploadPrepNote = '';
+  let localImageMap = {};
+  let requestUrl = '/api/quiz/upload';
+  let requestOptions = null;
+
+  clearLocalImageMap();
 
   try {
-    const prepared = await prepareUploadFile(selectedFile);
-    uploadFile = prepared.file;
-    uploadPrepNote = prepared.note;
+    const ext = extensionOf(selectedFile.name);
+    if (ext === '.docx' && selectedFile.size > FRONTEND_SAFE_UPLOAD_BYTES) {
+      setStatus(
+        `Large DOCX detected (${formatFileSize(
+          selectedFile.size,
+        )}). Extracting text and image references locally to bypass Vercel upload limits...`,
+      );
+
+      const extracted = await extractLargeDocxPayload(selectedFile);
+      localImageMap = extracted.imageMap;
+      uploadPrepNote =
+        'Large DOCX was parsed locally for upload safety. Embedded images are mapped by reference and should appear in related questions.';
+
+      requestUrl = '/api/quiz/from-text';
+      requestOptions = {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: extracted.text,
+          fileName: selectedFile.name,
+          timedMode: dom.timedMode.checked ? 'true' : 'false',
+          tutorMode: dom.tutorMode.checked ? 'true' : 'false',
+          useGemini: dom.useGemini.checked ? 'true' : 'false',
+        }),
+      };
+    } else {
+      const prepared = await prepareUploadFile(selectedFile);
+      uploadFile = prepared.file;
+      uploadPrepNote = prepared.note;
+
+      const formData = new FormData();
+      formData.append('document', uploadFile);
+      formData.append('timedMode', dom.timedMode.checked ? 'true' : 'false');
+      formData.append('tutorMode', dom.tutorMode.checked ? 'true' : 'false');
+      formData.append('useGemini', dom.useGemini.checked ? 'true' : 'false');
+
+      requestOptions = {
+        method: 'POST',
+        body: formData,
+      };
+    }
   } catch (error) {
     setStatus(error.message || 'Unable to prepare upload file.', 'error');
     return;
@@ -961,54 +1138,15 @@ async function uploadDocument(event) {
   setStatus('Processing document and building quiz...');
   dom.uploadBtn.disabled = true;
 
-  const formData = new FormData();
-  formData.append('document', uploadFile);
-  formData.append('timedMode', dom.timedMode.checked ? 'true' : 'false');
-  formData.append('tutorMode', dom.tutorMode.checked ? 'true' : 'false');
-  formData.append('useGemini', dom.useGemini.checked ? 'true' : 'false');
-
   try {
-    const response = await fetch('/api/quiz/upload', {
-      method: 'POST',
-      body: formData,
-    });
-
-    const rawBody = await response.text();
-    let body = {};
-    if (rawBody) {
-      try {
-        body = JSON.parse(rawBody);
-      } catch (error) {
-        if (/<!doctype html|<html/i.test(rawBody)) {
-          throw new Error('Server returned a non-JSON error page. Check deployment logs and retry.');
-        }
-        throw new Error(rawBody.slice(0, 240));
-      }
-    }
+    const response = await fetch(requestUrl, requestOptions);
+    const body = await parseResponseBody(response);
 
     if (!response.ok) {
       throw new Error(body.error || `Upload failed (HTTP ${response.status}).`);
     }
 
-    state.quiz = body.quiz;
-    state.currentIndex = 0;
-    state.answers = {};
-    state.selections = {};
-    state.submittedTutor = {};
-    state.flagged = new Set();
-    state.struck = {};
-    state.completed = false;
-    state.completionReason = '';
-    state.processing = body.processing;
-
-    state.timedMode = dom.timedMode.checked;
-    state.tutorMode = dom.tutorMode.checked;
-
-    dom.uploadSection.classList.add('hidden');
-    dom.quizSection.classList.remove('hidden');
-    dom.summary.classList.add('hidden');
-
-    startClock();
+    applyQuizToState(body, localImageMap);
 
     const parseInfo = body.processing?.parsing;
     const geminiInfo = body.processing?.gemini;
@@ -1152,6 +1290,8 @@ function makeNewTest() {
 dom.uploadForm.addEventListener('submit', uploadDocument);
 dom.prevBtn.addEventListener('click', goPrevious);
 dom.nextBtn.addEventListener('click', goNext);
+dom.topPrevBtn.addEventListener('click', goPrevious);
+dom.topNextBtn.addEventListener('click', goNext);
 dom.flagBtn.addEventListener('click', toggleFlag);
 dom.finishBtn.addEventListener('click', endBlock);
 dom.newTestBtn.addEventListener('click', makeNewTest);
@@ -1163,4 +1303,5 @@ dom.summary.addEventListener('click', onSummaryClick);
 
 window.addEventListener('beforeunload', () => {
   stopClock();
+  clearLocalImageMap();
 });

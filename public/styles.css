@@ -189,6 +189,31 @@ code {
   color: #d5ebff;
 }
 
+.top-arrow-row {
+  margin-top: 4px;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+
+.top-arrow-btn {
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  width: 34px;
+  height: 26px;
+  line-height: 1;
+  font-size: 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.top-arrow-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .top-right {
   justify-items: end;
 }
