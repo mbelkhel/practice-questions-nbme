@@ -15,8 +15,9 @@ const FILE_PLACEHOLDER_TEXT = 'Drag and drop a file here, or click Choose File.'
 const EXPLANATION_FALLBACK_PHRASE = 'could not be generated at this time';
 const EXPLANATION_SOURCE_MISSING_PHRASE = 'not available in the source';
 const EXPLANATION_BATCH_SIZE = 8;
-const EXPLANATION_BATCH_MAX_ATTEMPTS = 3;
-const EXPLANATION_BATCH_DELAY_MS = 2400;
+const EXPLANATION_BATCH_MAX_ATTEMPTS = 8;
+const EXPLANATION_BATCH_DELAY_MS = 8000;
+const EXPLANATION_BATCH_RATE_LIMIT_DELAY_MS = 25000;
 
 const dom = {
   uploadSection: document.getElementById('upload-section'),
@@ -549,6 +550,7 @@ async function backfillMissingExplanations() {
 
   try {
     while (token === state.explanationBackfillToken) {
+      let nextDelayMs = EXPLANATION_BATCH_DELAY_MS;
       const batch = getBackfillBatch();
       if (!batch.length) {
         break;
@@ -564,9 +566,16 @@ async function backfillMissingExplanations() {
       try {
         const body = await requestLiveExplanationBatch(batch);
         const updatedQuestions = Array.isArray(body.questions) ? body.questions : [];
+        const geminiInfo = body.processing?.gemini || {};
+        const hitRateLimit = geminiInfo.updatedQuestions === 0 && Number(geminiInfo.rateLimitFallbackCount || 0) > 0;
 
         for (const updated of updatedQuestions) {
-          if (mergeUpdatedQuestion(updated) && updated.id) {
+          if (!mergeUpdatedQuestion(updated) || !updated.id) {
+            continue;
+          }
+
+          const current = state.quiz.questions.find((item) => item.id === updated.id);
+          if (current && !questionNeedsLiveExplanation(current)) {
             state.explanationRequestTried[updated.id] = true;
           }
         }
@@ -587,8 +596,16 @@ async function backfillMissingExplanations() {
             state.explanationRequestTried[question.id] = true;
           }
         }
+
+        if (hitRateLimit) {
+          nextDelayMs = EXPLANATION_BATCH_RATE_LIMIT_DELAY_MS;
+        }
       } catch (error) {
         const message = error.message || 'Unable to generate explanation right now.';
+        const isRateLimit = /429|rate limit|quota|resource_exhausted/i.test(message);
+        if (isRateLimit) {
+          nextDelayMs = EXPLANATION_BATCH_RATE_LIMIT_DELAY_MS;
+        }
         for (const question of batch) {
           state.explanationRequestError[question.id] = message;
           if ((state.explanationBackfillAttempts[question.id] || 0) >= EXPLANATION_BATCH_MAX_ATTEMPTS) {
@@ -602,7 +619,7 @@ async function backfillMissingExplanations() {
         renderAll();
       }
 
-      await new Promise((resolve) => setTimeout(resolve, EXPLANATION_BATCH_DELAY_MS));
+      await new Promise((resolve) => setTimeout(resolve, nextDelayMs));
     }
   } finally {
     if (token === state.explanationBackfillToken) {
@@ -613,6 +630,10 @@ async function backfillMissingExplanations() {
 
 async function requestLiveExplanation(question) {
   if (!question || !question.id) {
+    return;
+  }
+
+  if (state.explanationBackfillRunning) {
     return;
   }
 
