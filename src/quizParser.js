@@ -2,9 +2,156 @@ const { normalizeWhitespace } = require('./fileTextExtractor');
 
 const OPTION_LABELS = ['A', 'B', 'C', 'D', 'E', 'F'];
 const IMAGE_PATH_REGEX = /\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?[^)\s]*)?$/i;
+const MULTI_SELECT_STEM_REGEX =
+  /\b(select all that apply|choose all that apply|which .* are correct|all of the following are true)\b/i;
 
 function isOptionLine(line) {
   return /^\s*[A-F][\).:]\s+/.test(line);
+}
+
+function normalizeOptionDisplayText(text) {
+  return normalizeWhitespace(String(text || '').replace(/^[☐☑✓]\s*/u, '').trim());
+}
+
+function normalizeBooleanToken(text) {
+  const normalized = normalizeWhitespace(String(text || '').replace(/^[☐☑✓]\s*/u, ''));
+  if (/^true$/i.test(normalized)) {
+    return 'TRUE';
+  }
+  if (/^false$/i.test(normalized)) {
+    return 'FALSE';
+  }
+  return '';
+}
+
+function isTrueFalseQuestionByOptions(question) {
+  if (!question || !Array.isArray(question.options) || question.options.length !== 2) {
+    return false;
+  }
+
+  const first = normalizeBooleanToken(question.options[0].text);
+  const second = normalizeBooleanToken(question.options[1].text);
+  return Boolean(first && second && first !== second);
+}
+
+function pickOptionForBoolean(question, boolValue) {
+  if (!question || !Array.isArray(question.options)) {
+    return null;
+  }
+
+  const target = String(boolValue || '').toUpperCase();
+  if (!target) {
+    return null;
+  }
+
+  const found = question.options.find((option) => normalizeBooleanToken(option.text) === target);
+  return found ? found.label : null;
+}
+
+function splitLetterAnswerToken(token) {
+  const cleaned = String(token || '').trim().toUpperCase().replace(/\s+AND\s+/g, ',');
+  if (!/^[A-F](?:\s*[,/;&+]\s*[A-F])*$/i.test(cleaned)) {
+    return [];
+  }
+
+  return cleaned
+    .split(/[,/;&+]/)
+    .map((part) => part.trim())
+    .filter((part) => /^[A-F]$/.test(part));
+}
+
+function splitNumericAnswerToken(token) {
+  const cleaned = String(token || '').trim();
+  if (!/^\d(?:\s*,\s*\d)*$/.test(cleaned)) {
+    return [];
+  }
+
+  return cleaned
+    .split(',')
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((value) => Number.isInteger(value) && value >= 1 && value <= OPTION_LABELS.length)
+    .map((value) => OPTION_LABELS[value - 1]);
+}
+
+function parseGeneralAnswerToken(rawToken) {
+  const token = normalizeWhitespace(String(rawToken || '').replace(/^[\-•]\s*/, ''));
+  if (!token) {
+    return {
+      correctOptions: [],
+      booleanValue: null,
+      rawToken: token,
+    };
+  }
+
+  const boolToken = normalizeBooleanToken(token);
+  if (boolToken) {
+    return {
+      correctOptions: [],
+      booleanValue: boolToken,
+      rawToken: token,
+    };
+  }
+
+  const letterOptions = splitLetterAnswerToken(token);
+  if (letterOptions.length) {
+    return {
+      correctOptions: letterOptions,
+      booleanValue: null,
+      rawToken: token,
+    };
+  }
+
+  const numericOptions = splitNumericAnswerToken(token);
+  if (numericOptions.length) {
+    return {
+      correctOptions: numericOptions,
+      booleanValue: null,
+      rawToken: token,
+    };
+  }
+
+  return {
+    correctOptions: [],
+    booleanValue: null,
+    rawToken: token,
+  };
+}
+
+function looksLikeAnswerTokenLine(line) {
+  const token = normalizeWhitespace(String(line || '').replace(/^[\-•]\s*/, ''));
+  if (!token) {
+    return false;
+  }
+
+  if (normalizeBooleanToken(token)) {
+    return true;
+  }
+
+  if (splitLetterAnswerToken(token).length > 0) {
+    return true;
+  }
+
+  if (splitNumericAnswerToken(token).length > 0) {
+    return true;
+  }
+
+  return false;
+}
+
+function inferQuestionType(question) {
+  if (Array.isArray(question.correctOptions) && question.correctOptions.length > 1) {
+    return 'multi_select';
+  }
+
+  if (isTrueFalseQuestionByOptions(question)) {
+    return 'true_false';
+  }
+
+  if (MULTI_SELECT_STEM_REGEX.test(question.stem || '')) {
+    return 'multi_select';
+  }
+
+  return 'single_select';
 }
 
 function maybePushImage(images, rawSource) {
@@ -77,7 +224,7 @@ function parseInlineOptions(blockText) {
   const stem = blockText.slice(0, firstMatch.index).trim();
   const options = matches.map((match) => ({
     label: match[1],
-    text: normalizeWhitespace(match[2]),
+    text: normalizeOptionDisplayText(match[2]),
   }));
 
   return { stem, options };
@@ -95,15 +242,15 @@ function parseUnlabeledTrailingOptions(lines) {
     const optionCandidate = nonEmpty.slice(i + 1);
 
     const stemTail = stemCandidate[stemCandidate.length - 1] || '';
-    const validOptionCount = optionCandidate.length >= 2 && optionCandidate.length <= 6;
-    const optionShapeLooksRight = optionCandidate.every((line) => line.length <= 140 && !/[?]$/.test(line));
+    const validOptionCount = optionCandidate.length >= 2 && optionCandidate.length <= OPTION_LABELS.length;
+    const optionShapeLooksRight = optionCandidate.every((line) => line.length <= 180 && !/[?]$/.test(line));
 
     if (validOptionCount && optionShapeLooksRight && /[:?]$/.test(stemTail)) {
       return {
         stem: normalizeWhitespace(stemCandidate.join('\n')),
         options: optionCandidate.map((text, idx) => ({
           label: OPTION_LABELS[idx],
-          text: normalizeWhitespace(text),
+          text: normalizeOptionDisplayText(text),
         })),
       };
     }
@@ -112,7 +259,7 @@ function parseUnlabeledTrailingOptions(lines) {
   return { stem: normalizeWhitespace(nonEmpty.join('\n')), options: [] };
 }
 
-function createQuestionFromParts(number, stem, options, embeddedAnswer = null) {
+function createQuestionFromParts(number, stem, options, embeddedAnswer = null, type = 'single_select') {
   const extractedStem = extractImageRefs(stem);
   const imageRefs = [...extractedStem.images];
   const cleanStem = extractedStem.text;
@@ -125,21 +272,26 @@ function createQuestionFromParts(number, stem, options, embeddedAnswer = null) {
 
     return {
       ...option,
-      text: extractedOption.text,
+      text: normalizeOptionDisplayText(extractedOption.text),
     };
   });
+
+  const cleanCorrectOption = embeddedAnswer && /^[A-F]$/.test(embeddedAnswer) ? embeddedAnswer : null;
 
   return {
     id: `q-${number}`,
     number,
+    type,
     stem: normalizeWhitespace(cleanStem),
     stemHtml: null,
     images: imageRefs,
     options: cleanOptions,
-    correctOption: embeddedAnswer,
+    correctOption: cleanCorrectOption,
+    correctOptions: cleanCorrectOption ? [cleanCorrectOption] : [],
     explanations: {},
     sourceExplanation: '',
     explanationSource: 'none',
+    rawAnswerToken: '',
   };
 }
 
@@ -186,7 +338,7 @@ function looksLikeOptionText(line) {
     return false;
   }
 
-  if (trimmed.length > 180) {
+  if (trimmed.length > 240) {
     return false;
   }
 
@@ -194,7 +346,124 @@ function looksLikeOptionText(line) {
 }
 
 function stripLeadingOptionMarker(text) {
-  return text.replace(/^\(?[A-F]\)?[).:\-]\s+/i, '').trim();
+  return String(text || '').replace(/^\(?[A-F]\)?[).:\-]\s+/i, '').trim();
+}
+
+function parseEmbeddedOptionFromStem(stemText) {
+  const stem = normalizeWhitespace(stemText);
+  if (!stem) {
+    return null;
+  }
+
+  const colonIndex = Math.max(stem.lastIndexOf(':'), stem.lastIndexOf('：'));
+  if (colonIndex < 0 || colonIndex >= stem.length - 8) {
+    return null;
+  }
+
+  const before = normalizeWhitespace(stem.slice(0, colonIndex));
+  const optionText = normalizeOptionDisplayText(stem.slice(colonIndex + 1));
+
+  if (!before || !optionText) {
+    return null;
+  }
+
+  if (optionText.length < 18 || optionText.length > 260) {
+    return null;
+  }
+
+  if (/[?]$/.test(optionText) || /^[A-F][).:]/i.test(optionText)) {
+    return null;
+  }
+
+  if (isLikelyQuestionStartLine(optionText)) {
+    return null;
+  }
+
+  if (!/\s/.test(optionText)) {
+    return null;
+  }
+
+  return {
+    stem: before,
+    optionText,
+  };
+}
+
+function relabelSequentialOptions(options) {
+  return options.slice(0, OPTION_LABELS.length).map((option, idx) => ({
+    label: OPTION_LABELS[idx],
+    text: normalizeOptionDisplayText(option.text),
+  }));
+}
+
+function tryRecoverLeadingOptionFromStem(question, missingLabels) {
+  if (!question || !Array.isArray(question.options)) {
+    return false;
+  }
+
+  if (!Array.isArray(missingLabels) || missingLabels.length === 0) {
+    return false;
+  }
+
+  if (question.options.length < 2 || question.options.length >= OPTION_LABELS.length) {
+    return false;
+  }
+
+  const expectedMissingLabel = OPTION_LABELS[question.options.length];
+  if (!missingLabels.includes(expectedMissingLabel)) {
+    return false;
+  }
+
+  const embedded = parseEmbeddedOptionFromStem(question.stem);
+  if (!embedded) {
+    return false;
+  }
+
+  question.stem = embedded.stem;
+  question.options = relabelSequentialOptions([
+    { text: embedded.optionText },
+    ...question.options.map((option) => ({ text: option.text })),
+  ]);
+  return true;
+}
+
+function expandTrueFalseClusterQuestion(stem, optionLines, numberStart) {
+  if (!/^true\s*or\s*false$/i.test((stem || '').trim())) {
+    return [];
+  }
+
+  const cleaned = optionLines
+    .map((line) => normalizeOptionDisplayText(stripLeadingOptionMarker(line)))
+    .filter(Boolean);
+
+  const questions = [];
+  let cursor = 0;
+  let number = numberStart;
+
+  while (cursor + 2 < cleaned.length) {
+    const statement = cleaned[cursor];
+    const firstBool = normalizeBooleanToken(cleaned[cursor + 1]);
+    const secondBool = normalizeBooleanToken(cleaned[cursor + 2]);
+
+    if (!statement || !firstBool || !secondBool || firstBool === secondBool) {
+      break;
+    }
+
+    const options = [
+      { label: 'A', text: firstBool === 'TRUE' ? 'True' : 'False' },
+      { label: 'B', text: secondBool === 'TRUE' ? 'True' : 'False' },
+    ];
+
+    questions.push(createQuestionFromParts(number, statement, options, null, 'true_false'));
+    number += 1;
+    cursor += 3;
+  }
+
+  if (questions.length >= 2 && cursor >= cleaned.length) {
+    return questions;
+  }
+
+  return [];
 }
 
 function parseUnnumberedQuestionBlocks(questionSection) {
@@ -270,18 +539,25 @@ function parseUnnumberedQuestionBlocks(questionSection) {
       optionLines.push(nextLine);
       cursor += 1;
 
-      if (optionLines.length >= OPTION_LABELS.length) {
+      if (optionLines.length >= 30) {
         break;
       }
     }
 
     if (optionLines.length >= 2) {
+      const stem = normalizeWhitespace(stemLines.join('\n'));
+      const expandedTrueFalse = expandTrueFalseClusterQuestion(stem, optionLines, number);
+      if (expandedTrueFalse.length > 0) {
+        questions.push(...expandedTrueFalse);
+        number += expandedTrueFalse.length;
+        continue;
+      }
+
       const options = optionLines.slice(0, OPTION_LABELS.length).map((text, idx) => ({
         label: OPTION_LABELS[idx],
-        text: normalizeWhitespace(stripLeadingOptionMarker(text)),
+        text: normalizeOptionDisplayText(stripLeadingOptionMarker(text)),
       }));
 
-      const stem = normalizeWhitespace(stemLines.join('\n'));
       const question = createQuestionFromParts(number, stem, options, null);
       questions.push(question);
       number += 1;
@@ -321,13 +597,13 @@ function parseQuestionBlock(number, blockText) {
 
       if (optionMatch) {
         if (current) {
-          current.text = normalizeWhitespace(current.text);
+          current.text = normalizeOptionDisplayText(current.text);
           options.push(current);
         }
 
         current = {
           label: optionMatch[1],
-          text: optionMatch[2] || '',
+          text: normalizeOptionDisplayText(optionMatch[2] || ''),
         };
 
         continue;
@@ -340,14 +616,14 @@ function parseQuestionBlock(number, blockText) {
       }
 
       if (current) {
-        current.text = `${current.text} ${line}`.trim();
+        current.text = normalizeOptionDisplayText(`${current.text} ${line}`.trim());
       } else {
         stem = `${stem} ${line}`.trim();
       }
     }
 
     if (current) {
-      current.text = normalizeWhitespace(current.text);
+      current.text = normalizeOptionDisplayText(current.text);
       options.push(current);
     }
   }
@@ -429,7 +705,8 @@ function splitQuestionAndAnswerSections(rawText) {
 
 function parseQuestions(questionSection) {
   const questions = [];
-  const explicitRegex = /(?:^|\n)\s*(?:question\s*|q\s*)(\d{1,3})\s*[\).:-]?\s*\n+([\s\S]*?)(?=\n\s*(?:question\s*|q\s*)\d{1,3}\s*[\).:-]?\s*\n+|$)/gi;
+  const explicitRegex =
+    /(?:^|\n)\s*(?:question\s*|q\s*)(\d{1,3})\s*[\).:-]?\s*\n+([\s\S]*?)(?=\n\s*(?:question\s*|q\s*)\d{1,3}\s*[\).:-]?\s*\n+|$)/gi;
   const numericRegex = /(?:^|\n)\s*(\d{1,3})\s*[\).]\s+([\s\S]*?)(?=\n\s*\d{1,3}\s*[\).]\s+|$)/g;
 
   let matches = [...questionSection.matchAll(explicitRegex)];
@@ -469,48 +746,27 @@ function parseSequentialAnswerSection(answerSection, questions) {
   const startIdx = lines.findIndex((line) => /^answers?$/i.test(line));
   const candidateLines = (startIdx >= 0 ? lines.slice(startIdx + 1) : lines).map((line) => line.trim());
 
-  function pickOptionForBoolean(question, boolValue) {
-    const boolText = boolValue.toLowerCase();
-    const matched = question.options.find((option) =>
-      new RegExp(`^\\s*☐?\\s*${boolText}\\b`, 'i').test(option.text),
-    );
-    if (matched) {
-      return matched.label;
-    }
-
-    return boolValue === 'TRUE' ? 'A' : 'B';
-  }
-
-  function parseTokenToOption(rawToken, question) {
-    const token = rawToken.trim().toUpperCase();
-
-    if (/^(?:[A-F](?:\s*,\s*[A-F])*)$/.test(token)) {
-      return token.split(',')[0].trim();
-    }
-
-    if (/^(TRUE|FALSE)$/.test(token)) {
-      return pickOptionForBoolean(question, token);
-    }
-
-    return null;
-  }
-
   let questionIdx = 0;
   for (const line of candidateLines) {
     if (questionIdx >= questions.length) {
       break;
     }
 
-    const question = questions[questionIdx];
-    const option = parseTokenToOption(line, question);
-    if (!option) {
+    if (!looksLikeAnswerTokenLine(line)) {
       continue;
     }
 
+    const question = questions[questionIdx];
+    const parsed = parseGeneralAnswerToken(line);
+
     answerMap.set(question.number, {
-      correctOption: option,
+      correctOption: parsed.correctOptions[0] || null,
+      correctOptions: parsed.correctOptions,
+      booleanValue: parsed.booleanValue,
       explanation: '',
+      rawAnswerToken: parsed.rawToken,
     });
+
     questionIdx += 1;
   }
 
@@ -524,22 +780,37 @@ function parseAnswerSection(answerSection) {
     return answerMap;
   }
 
-  const simpleKeyRegex = /(?:^|\n)\s*(?:q(?:uestion)?\s*)?(\d{1,3})\s*[\).:-]\s*([A-F])\b/gi;
+  const simpleKeyRegex = /(?:^|\n)\s*(?:q(?:uestion)?\s*)?(\d{1,3})\s*[\).:-]\s*([^\n]+)/gi;
   for (const match of answerSection.matchAll(simpleKeyRegex)) {
     const number = Number.parseInt(match[1], 10);
-    const option = match[2].toUpperCase();
+    const parsed = parseGeneralAnswerToken(match[2]);
 
-    if (!answerMap.has(number)) {
-      answerMap.set(number, {
-        correctOption: option,
-        explanation: '',
-      });
-    } else if (!answerMap.get(number).correctOption) {
-      answerMap.get(number).correctOption = option;
+    const existing = answerMap.get(number) || {
+      correctOption: null,
+      correctOptions: [],
+      booleanValue: null,
+      explanation: '',
+      rawAnswerToken: '',
+    };
+
+    if (existing.correctOptions.length === 0 && parsed.correctOptions.length > 0) {
+      existing.correctOptions = parsed.correctOptions;
+      existing.correctOption = parsed.correctOptions[0] || null;
     }
+
+    if (!existing.booleanValue && parsed.booleanValue) {
+      existing.booleanValue = parsed.booleanValue;
+    }
+
+    if (!existing.rawAnswerToken && parsed.rawToken) {
+      existing.rawAnswerToken = parsed.rawToken;
+    }
+
+    answerMap.set(number, existing);
   }
 
-  const blockRegex = /(?:^|\n)\s*(?:q(?:uestion)?\s*)?(\d{1,3})\s*[\).:-]?\s*(?:answer\s*[:\-]?\s*)?([\s\S]*?)(?=\n\s*(?:q(?:uestion)?\s*)?\d{1,3}\s*[\).:-]?\s*(?:answer\s*[:\-]?\s*)|$)/gi;
+  const blockRegex =
+    /(?:^|\n)\s*(?:q(?:uestion)?\s*)?(\d{1,3})\s*[\).:-]?\s*(?:answer\s*[:\-]?\s*)?([\s\S]*?)(?=\n\s*(?:q(?:uestion)?\s*)?\d{1,3}\s*[\).:-]?\s*(?:answer\s*[:\-]?\s*)|$)/gi;
   for (const match of answerSection.matchAll(blockRegex)) {
     const number = Number.parseInt(match[1], 10);
     const rawBody = normalizeWhitespace(match[2]);
@@ -548,18 +819,8 @@ function parseAnswerSection(answerSection) {
       continue;
     }
 
-    let correctOption = null;
+    const parsed = parseGeneralAnswerToken(rawBody);
     let explanation = rawBody;
-
-    const answerPrefixed = explanation.match(/(?:^|\b)(?:answer|ans|correct\s*answer)\s*[:\-]?\s*([A-F])\b/i);
-    if (answerPrefixed) {
-      correctOption = answerPrefixed[1].toUpperCase();
-    } else {
-      const leadingOption = explanation.match(/^\(?([A-F])\)?[\).:\-]/i);
-      if (leadingOption) {
-        correctOption = leadingOption[1].toUpperCase();
-      }
-    }
 
     const explanationOnly = explanation.match(/explanation\s*:\s*([\s\S]*)/i);
     if (explanationOnly) {
@@ -573,15 +834,27 @@ function parseAnswerSection(answerSection) {
 
     const existing = answerMap.get(number) || {
       correctOption: null,
+      correctOptions: [],
+      booleanValue: null,
       explanation: '',
+      rawAnswerToken: '',
     };
 
-    if (correctOption) {
-      existing.correctOption = correctOption;
+    if (existing.correctOptions.length === 0 && parsed.correctOptions.length > 0) {
+      existing.correctOptions = parsed.correctOptions;
+      existing.correctOption = parsed.correctOptions[0] || null;
+    }
+
+    if (!existing.booleanValue && parsed.booleanValue) {
+      existing.booleanValue = parsed.booleanValue;
     }
 
     if (explanation && explanation.length > existing.explanation.length) {
       existing.explanation = explanation;
+    }
+
+    if (!existing.rawAnswerToken && parsed.rawToken) {
+      existing.rawAnswerToken = parsed.rawToken;
     }
 
     answerMap.set(number, existing);
@@ -594,22 +867,63 @@ function applyAnswersToQuestions(questions, answerMap) {
   for (const question of questions) {
     const answer = answerMap.get(question.number);
 
-    if (!answer) {
-      continue;
-    }
+    if (answer) {
+      const declaredAnswerLabels = [];
+      if (Array.isArray(answer.correctOptions) && answer.correctOptions.length > 0) {
+        for (const label of answer.correctOptions) {
+          const normalized = String(label || '').toUpperCase();
+          if (/^[A-F]$/.test(normalized)) {
+            declaredAnswerLabels.push(normalized);
+          }
+        }
+      } else if (answer.correctOption) {
+        const normalized = String(answer.correctOption || '').toUpperCase();
+        if (/^[A-F]$/.test(normalized)) {
+          declaredAnswerLabels.push(normalized);
+        }
+      }
 
-    if (answer.correctOption) {
-      question.correctOption = answer.correctOption;
-    }
+      if (declaredAnswerLabels.length > 0) {
+        const availableLabels = new Set(question.options.map((option) => option.label));
+        const missingLabels = declaredAnswerLabels.filter((label) => !availableLabels.has(label));
+        if (missingLabels.length > 0) {
+          tryRecoverLeadingOptionFromStem(question, missingLabels);
+        }
+      }
 
-    if (answer.explanation) {
-      question.sourceExplanation = answer.explanation;
-      question.explanationSource = 'document';
+      let resolvedCorrectOptions = [];
 
-      if (question.correctOption) {
-        question.explanations[question.correctOption] = answer.explanation;
+      if (Array.isArray(answer.correctOptions) && answer.correctOptions.length > 0) {
+        resolvedCorrectOptions = answer.correctOptions
+          .map((label) => String(label || '').toUpperCase())
+          .filter((label) => question.options.some((option) => option.label === label));
+      } else if (answer.correctOption) {
+        const label = String(answer.correctOption || '').toUpperCase();
+        if (question.options.some((option) => option.label === label)) {
+          resolvedCorrectOptions = [label];
+        }
+      } else if (answer.booleanValue) {
+        const mapped = pickOptionForBoolean(question, answer.booleanValue);
+        if (mapped) {
+          resolvedCorrectOptions = [mapped];
+        }
+      }
+
+      question.correctOptions = resolvedCorrectOptions;
+      question.correctOption = resolvedCorrectOptions[0] || null;
+      question.rawAnswerToken = answer.rawAnswerToken || '';
+
+      if (answer.explanation) {
+        question.sourceExplanation = answer.explanation;
+        question.explanationSource = 'document';
+
+        if (question.correctOption) {
+          question.explanations[question.correctOption] = answer.explanation;
+        }
       }
     }
+
+    question.type = inferQuestionType(question);
   }
 }
 
@@ -618,7 +932,13 @@ function buildQuizFromText(rawText) {
   const questions = parseQuestions(questionSection);
 
   const answerMap = parseAnswerSection(answerSection);
-  const hasDirectMappedAnswers = [...answerMap.values()].some((answer) => Boolean(answer.correctOption));
+  const hasDirectMappedAnswers = [...answerMap.values()].some((answer) => {
+    return (
+      (Array.isArray(answer.correctOptions) && answer.correctOptions.length > 0) ||
+      Boolean(answer.correctOption) ||
+      Boolean(answer.booleanValue)
+    );
+  });
 
   if (!hasDirectMappedAnswers) {
     answerMap.clear();
@@ -643,7 +963,7 @@ function buildQuizFromText(rawText) {
     parsing: {
       detectedAnswerSection: Boolean(answerSection),
       totalQuestions: questions.length,
-      answersMapped: questions.filter((q) => q.correctOption).length,
+      answersMapped: questions.filter((q) => Array.isArray(q.correctOptions) && q.correctOptions.length > 0).length,
       explanationsMapped: questions.filter((q) => Object.keys(q.explanations).length > 0).length,
     },
   };

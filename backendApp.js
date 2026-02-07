@@ -100,6 +100,10 @@ async function buildQuizResponseFromText(text, requestBody, fileName = '') {
   if (useGemini) {
     gemini = await enrichQuestionsWithGemini(quiz.questions, {
       model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+      chunkSize: runningOnVercel ? 2 : 3,
+      perChunkTimeoutMs: runningOnVercel ? 9000 : 14000,
+      maxMilliseconds: runningOnVercel ? 42000 : 110000,
+      maxQuestions: runningOnVercel ? 36 : 120,
     });
   }
 

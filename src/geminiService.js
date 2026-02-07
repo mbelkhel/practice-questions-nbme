@@ -45,8 +45,32 @@ function extractJson(text) {
   return null;
 }
 
+function normalizeOptionLabels(value) {
+  if (Array.isArray(value)) {
+    const labels = [];
+    for (const item of value) {
+      const label = String(item || '').trim().toUpperCase();
+      if (/^[A-F]$/.test(label) && !labels.includes(label)) {
+        labels.push(label);
+      }
+    }
+    return labels;
+  }
+
+  const single = String(value || '').trim().toUpperCase();
+  return /^[A-F]$/.test(single) ? [single] : [];
+}
+
+function knownCorrectLabels(question) {
+  const byArray = normalizeOptionLabels(question.correctOptions);
+  if (byArray.length > 0) {
+    return byArray;
+  }
+  return normalizeOptionLabels(question.correctOption);
+}
+
 function hasSufficientExplanations(question) {
-  if (!question.correctOption) {
+  if (knownCorrectLabels(question).length === 0) {
     return false;
   }
 
@@ -69,6 +93,7 @@ function buildPromptPayload(question) {
     number: question.number,
     stem: question.stem,
     options: question.options,
+    knownCorrectOptions: knownCorrectLabels(question),
     knownCorrectOption: question.correctOption || null,
     knownExplanationForCorrect: question.sourceExplanation || null,
   };
@@ -79,14 +104,15 @@ function buildPrompt(chunk) {
 
   return [
     'You are helping build an NBME-style medical practice quiz.',
-    'For each question, identify the best answer choice and provide concise teaching explanations for every option.',
+    'For each question, provide concise teaching explanations for every option.',
+    'Only infer answer choice labels when none are supplied in knownCorrectOptions/knownCorrectOption.',
     'Return ONLY JSON as an array with this exact shape:',
-    '[{"number":1,"correctOption":"A","explanations":{"A":"...","B":"...","C":"...","D":"..."}}]',
+    '[{"number":1,"correctOption":"A","correctOptions":["A"],"explanations":{"A":"...","B":"...","C":"...","D":"..."}}]',
     'Rules:',
     '- Use only option labels provided.',
     '- Keep each explanation practical and educational (1-3 sentences).',
     '- Explain why the correct option is right and why each incorrect option is wrong.',
-    '- If knownCorrectOption is provided, keep it unless clearly impossible from the stem.',
+    '- If knownCorrectOptions/knownCorrectOption is provided, preserve it.',
     '',
     JSON.stringify(payload),
   ].join('\n');
@@ -97,8 +123,16 @@ function mergeAiResultIntoQuestion(question, generated) {
     return;
   }
 
-  if (generated.correctOption && /^[A-F]$/.test(generated.correctOption)) {
-    question.correctOption = generated.correctOption;
+  const hasExistingCorrect = knownCorrectLabels(question).length > 0;
+
+  if (!hasExistingCorrect) {
+    const generatedCorrectOptions = normalizeOptionLabels(generated.correctOptions);
+    const generatedCorrectOption = normalizeOptionLabels(generated.correctOption);
+    const resolvedCorrect = generatedCorrectOptions.length > 0 ? generatedCorrectOptions : generatedCorrectOption;
+    if (resolvedCorrect.length > 0) {
+      question.correctOptions = resolvedCorrect;
+      question.correctOption = resolvedCorrect[0];
+    }
   }
 
   const byOption = generated.explanations;
@@ -132,13 +166,32 @@ function mergeAiResultIntoQuestion(question, generated) {
   }
 }
 
-async function generateChunk(ai, model, chunk) {
+async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
   const prompt = buildPrompt(chunk);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const response = await ai.models.generateContent({
-    model,
-    contents: prompt,
-  });
+  let response;
+  try {
+    response = await ai.models.generateContent({
+      model,
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        temperature: 0.2,
+        abortSignal: controller.signal,
+      },
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const timeoutError = new Error(`Gemini chunk timed out after ${timeoutMs}ms.`);
+      timeoutError.code = 'GEMINI_TIMEOUT';
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 
   const parsed = extractJson(response.text);
 
@@ -152,6 +205,19 @@ async function generateChunk(ai, model, chunk) {
 async function enrichQuestionsWithGemini(questions, options = {}) {
   const apiKey = options.apiKey || process.env.GEMINI_API_KEY;
   const model = options.model || process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const chunkSize = Number.parseInt(String(options.chunkSize || process.env.GEMINI_CHUNK_SIZE || '3'), 10);
+  const perChunkTimeoutMs = Number.parseInt(
+    String(options.perChunkTimeoutMs || process.env.GEMINI_CHUNK_TIMEOUT_MS || '12000'),
+    10,
+  );
+  const maxMilliseconds = Number.parseInt(
+    String(options.maxMilliseconds || process.env.GEMINI_MAX_MS || '35000'),
+    10,
+  );
+  const maxQuestions = Number.parseInt(
+    String(options.maxQuestions || process.env.GEMINI_MAX_QUESTIONS || '40'),
+    10,
+  );
 
   if (!apiKey) {
     return {
@@ -170,15 +236,31 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
     };
   }
 
+  const limitedTargets = Number.isInteger(maxQuestions) && maxQuestions > 0 ? targets.slice(0, maxQuestions) : targets;
+  const skippedQuestions = Math.max(0, targets.length - limitedTargets.length);
+
   const ai = new GoogleGenAI({ apiKey });
-  const chunks = chunkArray(targets, 8);
+  const chunks = chunkArray(limitedTargets, Math.max(1, chunkSize));
 
   let updatedQuestions = 0;
   let failures = 0;
+  let processedQuestions = 0;
+  let timedOut = false;
+  const startedAt = Date.now();
 
   for (const chunk of chunks) {
+    const elapsedMs = Date.now() - startedAt;
+    const remainingMs = maxMilliseconds - elapsedMs;
+
+    if (remainingMs <= 1500) {
+      timedOut = true;
+      break;
+    }
+
+    const timeoutMs = Math.max(1500, Math.min(perChunkTimeoutMs, remainingMs - 250));
+
     try {
-      const generatedItems = await generateChunk(ai, model, chunk);
+      const generatedItems = await generateChunk(ai, model, chunk, timeoutMs);
       const generatedByNumber = new Map();
 
       for (const item of generatedItems) {
@@ -196,9 +278,26 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
           updatedQuestions += 1;
         }
       }
+
+      processedQuestions += chunk.length;
     } catch (error) {
       failures += 1;
+      if (error && error.code === 'GEMINI_TIMEOUT') {
+        timedOut = true;
+        break;
+      }
     }
+  }
+
+  const reasonParts = [];
+  if (skippedQuestions > 0) {
+    reasonParts.push(`Limited to first ${limitedTargets.length} question(s) to fit runtime.`);
+  }
+  if (timedOut) {
+    reasonParts.push('Stopped early due to runtime budget.');
+  }
+  if (failures > 0) {
+    reasonParts.push(`${failures} chunk(s) failed.`);
   }
 
   return {
@@ -206,6 +305,10 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
     model,
     updatedQuestions,
     failedChunks: failures,
+    processedQuestions,
+    skippedQuestions,
+    timedOut,
+    reason: reasonParts.join(' ') || '',
   };
 }
 

@@ -363,6 +363,10 @@ code {
   position: relative;
 }
 
+.select-circle.multi {
+  border-radius: 5px;
+}
+
 .select-circle.selected {
   border-color: var(--select);
 }
@@ -373,6 +377,11 @@ code {
   inset: 4px;
   border-radius: 999px;
   background: var(--select);
+}
+
+.select-circle.multi.selected::after {
+  inset: 4px;
+  border-radius: 2px;
 }
 
 .option-text {

@@ -265,8 +265,81 @@ function updateClockDisplay() {
   }
 }
 
+function questionTypeOf(question) {
+  const type = String(question?.type || '').trim().toLowerCase();
+  if (type === 'multi_select' || type === 'true_false') {
+    return type;
+  }
+  return 'single_select';
+}
+
+function isMultiSelectQuestion(question) {
+  return questionTypeOf(question) === 'multi_select';
+}
+
+function normalizeSelectedLabels(value) {
+  if (Array.isArray(value)) {
+    const uniq = [];
+    for (const item of value) {
+      const label = String(item || '').trim().toUpperCase();
+      if (/^[A-F]$/.test(label) && !uniq.includes(label)) {
+        uniq.push(label);
+      }
+    }
+    return uniq;
+  }
+
+  const single = String(value || '').trim().toUpperCase();
+  if (/^[A-F]$/.test(single)) {
+    return [single];
+  }
+
+  return [];
+}
+
+function correctLabelsFor(question) {
+  const byArray = normalizeSelectedLabels(question?.correctOptions);
+  if (byArray.length) {
+    return byArray;
+  }
+  return normalizeSelectedLabels(question?.correctOption);
+}
+
+function labelsEqual(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  const a = [...left].sort();
+  const b = [...right].sort();
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isQuestionCorrect(question) {
+  const selected = normalizeSelectedLabels(state.answers[question.id]);
+  if (!selected.length) {
+    return false;
+  }
+
+  const correct = correctLabelsFor(question);
+  if (!correct.length) {
+    return false;
+  }
+
+  return labelsEqual(selected, correct);
+}
+
+function formatLabels(labels) {
+  return labels.length ? labels.join(', ') : '-';
+}
+
 function isAnswered(question) {
-  return Boolean(state.answers[question.id]);
+  return normalizeSelectedLabels(state.answers[question.id]).length > 0;
 }
 
 function isWrong(question) {
@@ -274,12 +347,13 @@ function isWrong(question) {
     return false;
   }
 
-  const selected = state.answers[question.id];
-  if (!selected || !question.correctOption) {
+  const selected = normalizeSelectedLabels(state.answers[question.id]);
+  const correct = correctLabelsFor(question);
+  if (!selected.length || !correct.length) {
     return false;
   }
 
-  return selected !== question.correctOption;
+  return !labelsEqual(selected, correct);
 }
 
 function explanationFor(question, label) {
@@ -377,9 +451,10 @@ function renderPalette() {
 }
 
 function renderExplanation(question) {
-  const selected = state.answers[question.id];
+  const selectedLabels = normalizeSelectedLabels(state.answers[question.id]);
+  const correctLabels = correctLabelsFor(question);
   const tutorSubmitted = Boolean(state.submittedTutor[question.id]);
-  const showTutorExplanation = state.tutorMode && tutorSubmitted && selected;
+  const showTutorExplanation = state.tutorMode && tutorSubmitted && selectedLabels.length > 0;
   const showReviewExplanation = state.completed;
 
   if (!showTutorExplanation && !showReviewExplanation) {
@@ -392,8 +467,8 @@ function renderExplanation(question) {
 
   if (showReviewExplanation || showTutorExplanation) {
     question.options.forEach((option) => {
-      const isCorrect = question.correctOption === option.label;
-      const yourChoice = selected === option.label ? ' (Your choice)' : '';
+      const isCorrect = correctLabels.includes(option.label);
+      const yourChoice = selectedLabels.includes(option.label) ? ' (Your choice)' : '';
       lines.push(
         `<div class="expl-item"><strong>${isCorrect ? 'Correct' : 'Incorrect'} ${option.label}${yourChoice}</strong>: ${escapeHtml(
           explanationFor(question, option.label),
@@ -442,10 +517,32 @@ function selectAnswer(question, optionLabel) {
     return;
   }
 
+  const isMulti = isMultiSelectQuestion(question);
+  const currentValue = state.tutorMode ? state.selections[question.id] : state.answers[question.id];
+  const currentLabels = normalizeSelectedLabels(currentValue);
+
+  let nextValue = optionLabel;
+  if (isMulti) {
+    const nextLabels = [...currentLabels];
+    if (nextLabels.includes(optionLabel)) {
+      const idx = nextLabels.indexOf(optionLabel);
+      nextLabels.splice(idx, 1);
+    } else {
+      nextLabels.push(optionLabel);
+    }
+    nextValue = nextLabels;
+  }
+
   if (state.tutorMode) {
-    state.selections[question.id] = optionLabel;
+    if (Array.isArray(nextValue) && nextValue.length === 0) {
+      delete state.selections[question.id];
+    } else {
+      state.selections[question.id] = nextValue;
+    }
+  } else if (Array.isArray(nextValue) && nextValue.length === 0) {
+    delete state.answers[question.id];
   } else {
-    state.answers[question.id] = optionLabel;
+    state.answers[question.id] = nextValue;
   }
 
   if (state.struck[question.id] && state.struck[question.id].has(optionLabel)) {
@@ -476,9 +573,11 @@ function renderQuestion() {
   dom.stem.innerHTML = question.stemHtml;
   renderQuestionImages(question);
 
-  const submittedSelection = state.answers[question.id] || null;
-  const pendingSelection = state.selections[question.id] || null;
-  const activeSelection = submittedSelection || pendingSelection;
+  const isMulti = isMultiSelectQuestion(question);
+  const submittedSelection = normalizeSelectedLabels(state.answers[question.id]);
+  const pendingSelection = normalizeSelectedLabels(state.selections[question.id]);
+  const activeSelection = submittedSelection.length > 0 ? submittedSelection : pendingSelection;
+  const correctLabels = correctLabelsFor(question);
   const tutorSubmitted = Boolean(state.submittedTutor[question.id]);
   const reveal = state.completed || (state.tutorMode && tutorSubmitted);
   const lockForTutor = state.tutorMode && tutorSubmitted;
@@ -497,8 +596,9 @@ function renderQuestion() {
     const selectCircle = document.createElement('button');
     selectCircle.type = 'button';
     selectCircle.className = 'select-circle';
+    selectCircle.classList.toggle('multi', isMulti);
 
-    if (activeSelection === option.label) {
+    if (activeSelection.includes(option.label)) {
       selectCircle.classList.add('selected');
     }
 
@@ -515,15 +615,10 @@ function renderQuestion() {
     const badge = document.createElement('span');
     badge.className = 'option-badge';
 
-    if (reveal && question.correctOption === option.label) {
+    if (reveal && correctLabels.includes(option.label)) {
       row.classList.add('review-correct');
-      badge.textContent = submittedSelection === option.label ? 'Your answer + Correct' : 'Correct';
-    } else if (
-      reveal &&
-      submittedSelection === option.label &&
-      question.correctOption &&
-      submittedSelection !== question.correctOption
-    ) {
+      badge.textContent = submittedSelection.includes(option.label) ? 'Your answer + Correct' : 'Correct';
+    } else if (reveal && submittedSelection.includes(option.label) && !correctLabels.includes(option.label)) {
       row.classList.add('review-wrong');
       badge.textContent = 'Your answer';
     } else {
@@ -545,8 +640,8 @@ function renderQuestion() {
       dom.submitAnswerBtn.textContent = 'Submitted';
       dom.submitAnswerBtn.disabled = true;
     } else {
-      dom.submitAnswerBtn.textContent = 'Submit Answer';
-      dom.submitAnswerBtn.disabled = !Boolean(pendingSelection);
+      dom.submitAnswerBtn.textContent = isMulti ? 'Submit Answers' : 'Submit Answer';
+      dom.submitAnswerBtn.disabled = pendingSelection.length === 0;
     }
   } else {
     dom.submitAnswerBtn.classList.add('hidden');
@@ -574,6 +669,29 @@ function renderChips() {
   dom.chipTutor.textContent = state.tutorMode ? 'Tutor On' : 'Tutor Off';
 }
 
+function calculateQuizStats() {
+  if (!state.quiz) {
+    return {
+      total: 0,
+      answered: 0,
+      correct: 0,
+      percent: 0,
+    };
+  }
+
+  const total = state.quiz.questions.length;
+  const answered = state.quiz.questions.filter((q) => isAnswered(q)).length;
+  const correct = state.quiz.questions.filter((q) => isQuestionCorrect(q)).length;
+  const percent = total ? Math.round((correct / total) * 100) : 0;
+
+  return { total, answered, correct, percent };
+}
+
+function showEndBlockPopup() {
+  const { total, correct, percent } = calculateQuizStats();
+  window.alert(`Block complete\nCorrect: ${correct}/${total}\nScore: ${percent}%`);
+}
+
 function renderSummary() {
   if (!state.completed) {
     dom.summary.classList.add('hidden');
@@ -581,11 +699,7 @@ function renderSummary() {
     return;
   }
 
-  const total = state.quiz.questions.length;
-  const answered = state.quiz.questions.filter((q) => state.answers[q.id]).length;
-  const correct = state.quiz.questions.filter(
-    (q) => q.correctOption && state.answers[q.id] === q.correctOption,
-  ).length;
+  const { total, answered, correct, percent } = calculateQuizStats();
 
   const completionLine =
     state.completionReason === 'time'
@@ -594,14 +708,16 @@ function renderSummary() {
 
   const rows = state.quiz.questions
     .map((question, index) => {
-      const selected = state.answers[question.id] || '-';
-      const correctOption = question.correctOption || '-';
+      const selectedLabels = normalizeSelectedLabels(state.answers[question.id]);
+      const correctLabels = correctLabelsFor(question);
+      const selected = formatLabels(selectedLabels);
+      const correctOption = formatLabels(correctLabels);
 
       let status = 'unanswered';
       let label = 'Unanswered';
 
-      if (selected !== '-') {
-        if (selected === correctOption) {
+      if (selectedLabels.length > 0) {
+        if (labelsEqual(selectedLabels, correctLabels)) {
           status = 'correct';
           label = 'Correct';
         } else {
@@ -625,7 +741,7 @@ function renderSummary() {
     <div class="summary-metrics">
       <span>Correct: ${correct}/${total}</span>
       <span>Answered: ${answered}/${total}</span>
-      <span>Score: ${total ? Math.round((correct / total) * 100) : 0}%</span>
+      <span>Score: ${percent}%</span>
       <span>Elapsed: ${formatClock(state.elapsedSeconds)}</span>
     </div>
     <div class="review-grid">${rows}</div>
@@ -771,7 +887,9 @@ function parseDocxRelationships(xml) {
 }
 
 function insertDocxImageMarkers(xml, relMap) {
-  return String(xml || '').replace(/<w:drawing[\s\S]*?<\/w:drawing>/gi, (drawingXml) => {
+  let output = String(xml || '');
+
+  output = output.replace(/<w:drawing[\s\S]*?<\/w:drawing>/gi, (drawingXml) => {
     const relMatch = drawingXml.match(/\br:embed="([^"]+)"/i) || drawingXml.match(/\br:link="([^"]+)"/i);
     if (!relMatch) {
       return '\n';
@@ -785,6 +903,26 @@ function insertDocxImageMarkers(xml, relMap) {
 
     return `\n[IMAGE:${fileName}]\n`;
   });
+
+  output = output.replace(/<w:pict[\s\S]*?<\/w:pict>/gi, (pictXml) => {
+    const relMatch =
+      pictXml.match(/\br:id="([^"]+)"/i) ||
+      pictXml.match(/\bo:relid="([^"]+)"/i) ||
+      pictXml.match(/\br:link="([^"]+)"/i);
+    if (!relMatch) {
+      return '\n';
+    }
+
+    const target = relMap[relMatch[1]] || '';
+    const fileName = target.split('/').pop();
+    if (!fileName) {
+      return '\n';
+    }
+
+    return `\n[IMAGE:${fileName}]\n`;
+  });
+
+  return output;
 }
 
 function xmlToNormalizedDocxText(xml) {
@@ -1162,6 +1300,9 @@ async function uploadDocument(event) {
       parts.push(
         `Gemini updated ${geminiInfo.updatedQuestions} question(s)${geminiInfo.failedChunks ? ` with ${geminiInfo.failedChunks} failed chunk(s)` : ''}.`,
       );
+      if (geminiInfo.reason) {
+        parts.push(geminiInfo.reason);
+      }
     } else if (geminiInfo?.reason) {
       parts.push(`Gemini skipped: ${geminiInfo.reason}`);
     }
@@ -1266,12 +1407,16 @@ function submitCurrentTutorAnswer() {
     return;
   }
 
-  const selection = state.selections[question.id];
-  if (!selection) {
+  const selectionLabels = normalizeSelectedLabels(state.selections[question.id]);
+  if (selectionLabels.length === 0) {
     return;
   }
 
-  state.answers[question.id] = selection;
+  if (isMultiSelectQuestion(question)) {
+    state.answers[question.id] = selectionLabels;
+  } else {
+    state.answers[question.id] = selectionLabels[0];
+  }
   state.submittedTutor[question.id] = true;
   renderAll();
 }
@@ -1280,6 +1425,7 @@ function endBlock() {
   if (!state.quiz || state.completed) {
     return;
   }
+  showEndBlockPopup();
   completeQuiz('manual');
 }
 
