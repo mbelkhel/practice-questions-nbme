@@ -11,15 +11,22 @@ const DOCX_COMPRESSION_PASSES = [
   { label: 'aggressive', maxDimension: 800, quality: 0.45, minSourceBytes: 1 },
   { label: 'ultra', maxDimension: 560, quality: 0.35, minSourceBytes: 1 },
 ];
+const FILE_PLACEHOLDER_TEXT = 'Drag and drop a file here, or click Choose File.';
 
 const dom = {
   uploadSection: document.getElementById('upload-section'),
   uploadForm: document.getElementById('upload-form'),
+  fileDropzone: document.getElementById('file-dropzone'),
+  pickFileBtn: document.getElementById('pick-file-btn'),
+  selectedFileName: document.getElementById('selected-file-name'),
   documentInput: document.getElementById('document-input'),
   timedMode: document.getElementById('timed-mode'),
   tutorMode: document.getElementById('tutor-mode'),
-  useGemini: document.getElementById('use-gemini'),
   uploadBtn: document.getElementById('upload-btn'),
+  uploadProgressWrap: document.getElementById('upload-progress-wrap'),
+  uploadProgressLabel: document.getElementById('upload-progress-label'),
+  uploadProgressValue: document.getElementById('upload-progress-value'),
+  uploadProgressBar: document.getElementById('upload-progress-bar'),
   uploadStatus: document.getElementById('upload-status'),
   quizSection: document.getElementById('quiz-section'),
   quizTitle: document.getElementById('quiz-title'),
@@ -82,6 +89,65 @@ function setStatus(message, type = '') {
   if (type) {
     dom.uploadStatus.classList.add(type);
   }
+}
+
+function setSelectedFileName(file) {
+  if (!dom.selectedFileName) {
+    return;
+  }
+
+  if (!file) {
+    dom.selectedFileName.textContent = FILE_PLACEHOLDER_TEXT;
+    return;
+  }
+
+  dom.selectedFileName.textContent = `${file.name} (${formatFileSize(file.size)})`;
+}
+
+function setDropzoneActive(active) {
+  if (!dom.fileDropzone) {
+    return;
+  }
+  dom.fileDropzone.classList.toggle('drag-active', Boolean(active));
+}
+
+function setUploadProgress(percent, label = '') {
+  const clamped = Math.max(0, Math.min(100, Math.round(percent)));
+  if (dom.uploadProgressBar) {
+    dom.uploadProgressBar.style.width = `${clamped}%`;
+  }
+  if (dom.uploadProgressValue) {
+    dom.uploadProgressValue.textContent = `${clamped}%`;
+  }
+  if (label && dom.uploadProgressLabel) {
+    dom.uploadProgressLabel.textContent = label;
+  }
+  dom.uploadProgressWrap?.classList.remove('hidden');
+}
+
+function hideUploadProgress() {
+  dom.uploadProgressWrap?.classList.add('hidden');
+}
+
+function hasFileTransfer(event) {
+  const types = Array.from(event?.dataTransfer?.types || []);
+  return types.includes('Files');
+}
+
+function setInputFile(file) {
+  if (!file || !dom.documentInput) {
+    return;
+  }
+
+  try {
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    dom.documentInput.files = transfer.files;
+  } catch (error) {
+    return;
+  }
+
+  setSelectedFileName(file);
 }
 
 function formatClock(totalSeconds) {
@@ -793,6 +859,8 @@ function resetToUploadScreen() {
   state.elapsedSeconds = 0;
 
   dom.documentInput.value = '';
+  setSelectedFileName(null);
+  hideUploadProgress();
   dom.quizSection.classList.add('hidden');
   dom.summary.classList.add('hidden');
   dom.uploadSection.classList.remove('hidden');
@@ -1168,8 +1236,7 @@ async function prepareUploadFile(rawFile) {
   );
 }
 
-async function parseResponseBody(response) {
-  const rawBody = await response.text();
+function parseResponseText(rawBody) {
   let body = {};
   if (rawBody) {
     try {
@@ -1182,6 +1249,46 @@ async function parseResponseBody(response) {
     }
   }
   return body;
+}
+
+async function requestJsonWithProgress(url, requestOptions, onUploadProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(requestOptions?.method || 'POST', url, true);
+
+    const headers = requestOptions?.headers || {};
+    for (const [key, value] of Object.entries(headers)) {
+      xhr.setRequestHeader(key, value);
+    }
+
+    if (typeof onUploadProgress === 'function' && xhr.upload) {
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable || event.total <= 0) {
+          return;
+        }
+        onUploadProgress(event.loaded / event.total);
+      };
+    }
+
+    xhr.onerror = () => {
+      reject(new Error('Network error while uploading file.'));
+    };
+
+    xhr.onload = () => {
+      try {
+        const body = parseResponseText(xhr.responseText || '');
+        resolve({
+          ok: xhr.status >= 200 && xhr.status < 300,
+          status: xhr.status,
+          body,
+        });
+      } catch (error) {
+        reject(error);
+      }
+    };
+
+    xhr.send(requestOptions?.body || null);
+  });
 }
 
 function applyQuizToState(body, localImageMap = {}) {
@@ -1223,6 +1330,8 @@ async function uploadDocument(event) {
   let requestOptions = null;
 
   clearLocalImageMap();
+  hideUploadProgress();
+  setUploadProgress(0, 'Preparing upload...');
 
   try {
     const ext = extensionOf(selectedFile.name);
@@ -1249,7 +1358,6 @@ async function uploadDocument(event) {
           fileName: selectedFile.name,
           timedMode: dom.timedMode.checked ? 'true' : 'false',
           tutorMode: dom.tutorMode.checked ? 'true' : 'false',
-          useGemini: dom.useGemini.checked ? 'true' : 'false',
         }),
       };
     } else {
@@ -1261,7 +1369,6 @@ async function uploadDocument(event) {
       formData.append('document', uploadFile);
       formData.append('timedMode', dom.timedMode.checked ? 'true' : 'false');
       formData.append('tutorMode', dom.tutorMode.checked ? 'true' : 'false');
-      formData.append('useGemini', dom.useGemini.checked ? 'true' : 'false');
 
       requestOptions = {
         method: 'POST',
@@ -1269,22 +1376,30 @@ async function uploadDocument(event) {
       };
     }
   } catch (error) {
+    hideUploadProgress();
     setStatus(error.message || 'Unable to prepare upload file.', 'error');
     return;
   }
 
-  setStatus('Processing document and building quiz...');
+  setStatus('Uploading file and building quiz...');
   dom.uploadBtn.disabled = true;
+  setUploadProgress(3, 'Uploading file...');
 
   try {
-    const response = await fetch(requestUrl, requestOptions);
-    const body = await parseResponseBody(response);
+    const response = await requestJsonWithProgress(requestUrl, requestOptions, (fraction) => {
+      const percent = Math.max(3, Math.min(92, Math.round(fraction * 92)));
+      setUploadProgress(percent, 'Uploading file...');
+    });
+
+    setUploadProgress(96, 'Processing questions and explanations...');
+    const body = response.body;
 
     if (!response.ok) {
       throw new Error(body.error || `Upload failed (HTTP ${response.status}).`);
     }
 
     applyQuizToState(body, localImageMap);
+    setUploadProgress(100, 'Quiz ready.');
 
     const parseInfo = body.processing?.parsing;
     const geminiInfo = body.processing?.gemini;
@@ -1318,8 +1433,12 @@ async function uploadDocument(event) {
     setStatus(parts.join(' '), 'success');
     renderAll();
   } catch (error) {
+    hideUploadProgress();
     setStatus(error.message || 'Unable to process file.', 'error');
   } finally {
+    if (!state.quiz) {
+      hideUploadProgress();
+    }
     dom.uploadBtn.disabled = false;
   }
 }
@@ -1393,6 +1512,51 @@ function onSummaryClick(event) {
   window.scrollTo({ top: dom.quizSection.offsetTop, behavior: 'smooth' });
 }
 
+function onDocumentInputChange() {
+  const file = dom.documentInput.files?.[0] || null;
+  setSelectedFileName(file);
+}
+
+function onDropzoneDragEnter(event) {
+  if (!hasFileTransfer(event)) {
+    return;
+  }
+  event.preventDefault();
+  setDropzoneActive(true);
+}
+
+function onDropzoneDragOver(event) {
+  if (!hasFileTransfer(event)) {
+    return;
+  }
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+  setDropzoneActive(true);
+}
+
+function onDropzoneDragLeave(event) {
+  if (!event.currentTarget.contains(event.relatedTarget)) {
+    setDropzoneActive(false);
+  }
+}
+
+function onDropzoneDrop(event) {
+  if (!hasFileTransfer(event)) {
+    return;
+  }
+  event.preventDefault();
+  setDropzoneActive(false);
+  const file = event.dataTransfer.files?.[0];
+  if (!file) {
+    return;
+  }
+  setInputFile(file);
+}
+
+function onPickFileClick() {
+  dom.documentInput?.click();
+}
+
 function submitCurrentTutorAnswer() {
   if (!state.quiz || !state.tutorMode || state.completed) {
     return;
@@ -1434,6 +1598,12 @@ function makeNewTest() {
 }
 
 dom.uploadForm.addEventListener('submit', uploadDocument);
+dom.documentInput.addEventListener('change', onDocumentInputChange);
+dom.pickFileBtn.addEventListener('click', onPickFileClick);
+dom.fileDropzone.addEventListener('dragenter', onDropzoneDragEnter);
+dom.fileDropzone.addEventListener('dragover', onDropzoneDragOver);
+dom.fileDropzone.addEventListener('dragleave', onDropzoneDragLeave);
+dom.fileDropzone.addEventListener('drop', onDropzoneDrop);
 dom.prevBtn.addEventListener('click', goPrevious);
 dom.nextBtn.addEventListener('click', goNext);
 dom.topPrevBtn.addEventListener('click', goPrevious);
@@ -1451,3 +1621,6 @@ window.addEventListener('beforeunload', () => {
   stopClock();
   clearLocalImageMap();
 });
+
+setSelectedFileName(null);
+hideUploadProgress();

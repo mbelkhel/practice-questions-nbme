@@ -90,23 +90,14 @@ async function buildQuizResponseFromText(text, requestBody, fileName = '') {
     };
   }
 
-  const useGemini = toBool(requestBody?.useGemini, true);
-  let gemini = {
-    attempted: false,
-    updatedQuestions: 0,
-    reason: 'Disabled by request.',
-  };
-
-  if (useGemini) {
-    gemini = await enrichQuestionsWithGemini(quiz.questions, {
-      model: 'gemma-3-12b-it',
-      modelChain: ['gemma-3-12b-it'],
-      chunkSize: 1,
-      perChunkTimeoutMs: runningOnVercel ? 50000 : 80000,
-      maxMilliseconds: runningOnVercel ? 55000 : 180000,
-      maxQuestions: runningOnVercel ? 1 : 120,
-    });
-  }
+  const gemini = await enrichQuestionsWithGemini(quiz.questions, {
+    model: 'gemini-3.0-flash',
+    modelChain: ['gemini-3.0-flash', 'gemini-2.5-flash', 'gemma-3-12b-it'],
+    chunkSize: runningOnVercel ? 20 : 28,
+    perChunkTimeoutMs: runningOnVercel ? 14000 : 22000,
+    maxMilliseconds: runningOnVercel ? 52000 : 170000,
+    maxQuestions: runningOnVercel ? 180 : 240,
+  });
 
   for (const question of quiz.questions) {
     for (const option of question.options) {
@@ -118,7 +109,7 @@ async function buildQuizResponseFromText(text, requestBody, fileName = '') {
           }
         } else {
           question.explanations[option.label] =
-            'Explanation not available in source. Enable Gemini with a valid API key to auto-generate rationale.';
+            'Explanation was not available in the source and could not be generated at this time.';
         }
       }
     }
