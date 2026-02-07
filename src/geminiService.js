@@ -113,7 +113,11 @@ function isJsonModeUnsupportedError(error) {
   const text = errorText(error);
   return (
     (text.includes('invalid_argument') || text.includes('400') || text.includes('bad request')) &&
-    (text.includes('responsemimetype') || text.includes('response mime') || text.includes('application/json'))
+    (text.includes('responsemimetype') ||
+      text.includes('response mime') ||
+      text.includes('application/json') ||
+      text.includes('json mode is not enabled') ||
+      text.includes('json mode'))
   );
 }
 
