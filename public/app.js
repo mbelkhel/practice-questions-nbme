@@ -14,6 +14,9 @@ const DOCX_COMPRESSION_PASSES = [
 const FILE_PLACEHOLDER_TEXT = 'Drag and drop a file here, or click Choose File.';
 const EXPLANATION_FALLBACK_PHRASE = 'could not be generated at this time';
 const EXPLANATION_SOURCE_MISSING_PHRASE = 'not available in the source';
+const EXPLANATION_BATCH_SIZE = 6;
+const EXPLANATION_BATCH_MAX_ATTEMPTS = 3;
+const EXPLANATION_BATCH_DELAY_MS = 180;
 
 const dom = {
   uploadSection: document.getElementById('upload-section'),
@@ -27,8 +30,6 @@ const dom = {
   uploadBtn: document.getElementById('upload-btn'),
   uploadProgressWrap: document.getElementById('upload-progress-wrap'),
   uploadProgressLabel: document.getElementById('upload-progress-label'),
-  uploadProgressValue: document.getElementById('upload-progress-value'),
-  uploadProgressBar: document.getElementById('upload-progress-bar'),
   uploadStatus: document.getElementById('upload-status'),
   quizSection: document.getElementById('quiz-section'),
   quizTitle: document.getElementById('quiz-title'),
@@ -77,6 +78,9 @@ const state = {
   explanationRequestInFlight: {},
   explanationRequestTried: {},
   explanationRequestError: {},
+  explanationBackfillToken: 0,
+  explanationBackfillRunning: false,
+  explanationBackfillAttempts: {},
 };
 
 function escapeHtml(value) {
@@ -118,14 +122,8 @@ function setDropzoneActive(active) {
 
 function setUploadProgress(percent, label = '') {
   const clamped = Math.max(0, Math.min(100, Math.round(percent)));
-  if (dom.uploadProgressBar) {
-    dom.uploadProgressBar.style.width = `${clamped}%`;
-  }
-  if (dom.uploadProgressValue) {
-    dom.uploadProgressValue.textContent = `${clamped}%`;
-  }
-  if (label && dom.uploadProgressLabel) {
-    dom.uploadProgressLabel.textContent = label;
+  if (dom.uploadProgressLabel) {
+    dom.uploadProgressLabel.textContent = label || (clamped >= 100 ? 'Finalizing quiz...' : 'Working...');
   }
   dom.uploadProgressWrap?.classList.remove('hidden');
 }
@@ -451,6 +449,168 @@ function questionNeedsLiveExplanation(question) {
   return question.options.some((option) => isFallbackExplanationText(question.explanations?.[option.label]));
 }
 
+function buildQuestionPayload(question) {
+  return {
+    id: question.id,
+    number: question.number,
+    type: question.type,
+    stem: question.stem,
+    options: question.options,
+    correctOption: question.correctOption,
+    correctOptions: question.correctOptions,
+    explanations: question.explanations,
+    sourceExplanation: question.sourceExplanation,
+    explanationSource: question.explanationSource,
+  };
+}
+
+function mergeUpdatedQuestion(updated) {
+  if (!state.quiz || !updated || !updated.id) {
+    return false;
+  }
+
+  const current = state.quiz.questions.find((question) => question.id === updated.id);
+  if (!current) {
+    return false;
+  }
+
+  current.explanations = updated.explanations || current.explanations || {};
+  current.explanationSource = updated.explanationSource || current.explanationSource;
+  if (updated.correctOption) {
+    current.correctOption = updated.correctOption;
+  }
+  if (Array.isArray(updated.correctOptions) && updated.correctOptions.length > 0) {
+    current.correctOptions = updated.correctOptions;
+  }
+
+  return true;
+}
+
+function getBackfillBatch() {
+  if (!state.quiz?.questions?.length) {
+    return [];
+  }
+
+  const batch = [];
+  for (const question of state.quiz.questions) {
+    if (!questionNeedsLiveExplanation(question)) {
+      continue;
+    }
+
+    if (state.explanationRequestInFlight[question.id]) {
+      continue;
+    }
+
+    const attempts = state.explanationBackfillAttempts[question.id] || 0;
+    if (attempts >= EXPLANATION_BATCH_MAX_ATTEMPTS) {
+      continue;
+    }
+
+    batch.push(question);
+    if (batch.length >= EXPLANATION_BATCH_SIZE) {
+      break;
+    }
+  }
+
+  return batch;
+}
+
+async function requestLiveExplanationBatch(batch) {
+  const response = await fetch('/api/quiz/explain-batch', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      questions: batch.map((question) => buildQuestionPayload(question)),
+    }),
+  });
+
+  const body = parseResponseText(await response.text());
+  if (!response.ok) {
+    throw new Error(body.error || `Batch explanation generation failed (HTTP ${response.status}).`);
+  }
+
+  return body;
+}
+
+async function backfillMissingExplanations() {
+  if (!state.quiz || state.explanationBackfillRunning) {
+    return;
+  }
+
+  const seedBatch = getBackfillBatch();
+  if (!seedBatch.length) {
+    return;
+  }
+
+  state.explanationBackfillRunning = true;
+  const token = ++state.explanationBackfillToken;
+
+  try {
+    while (token === state.explanationBackfillToken) {
+      const batch = getBackfillBatch();
+      if (!batch.length) {
+        break;
+      }
+
+      for (const question of batch) {
+        state.explanationBackfillAttempts[question.id] = (state.explanationBackfillAttempts[question.id] || 0) + 1;
+        state.explanationRequestInFlight[question.id] = true;
+        state.explanationRequestError[question.id] = '';
+      }
+      renderAll();
+
+      try {
+        const body = await requestLiveExplanationBatch(batch);
+        const updatedQuestions = Array.isArray(body.questions) ? body.questions : [];
+
+        for (const updated of updatedQuestions) {
+          if (mergeUpdatedQuestion(updated) && updated.id) {
+            state.explanationRequestTried[updated.id] = true;
+          }
+        }
+
+        for (const question of batch) {
+          const current = state.quiz.questions.find((item) => item.id === question.id);
+          if (!current) {
+            continue;
+          }
+
+          if (!questionNeedsLiveExplanation(current)) {
+            state.explanationRequestError[question.id] = '';
+            state.explanationRequestTried[question.id] = true;
+            continue;
+          }
+
+          if ((state.explanationBackfillAttempts[question.id] || 0) >= EXPLANATION_BATCH_MAX_ATTEMPTS) {
+            state.explanationRequestTried[question.id] = true;
+          }
+        }
+      } catch (error) {
+        const message = error.message || 'Unable to generate explanation right now.';
+        for (const question of batch) {
+          state.explanationRequestError[question.id] = message;
+          if ((state.explanationBackfillAttempts[question.id] || 0) >= EXPLANATION_BATCH_MAX_ATTEMPTS) {
+            state.explanationRequestTried[question.id] = true;
+          }
+        }
+      } finally {
+        for (const question of batch) {
+          state.explanationRequestInFlight[question.id] = false;
+        }
+        renderAll();
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, EXPLANATION_BATCH_DELAY_MS));
+    }
+  } finally {
+    if (token === state.explanationBackfillToken) {
+      state.explanationBackfillRunning = false;
+    }
+  }
+}
+
 async function requestLiveExplanation(question) {
   if (!question || !question.id) {
     return;
@@ -472,18 +632,7 @@ async function requestLiveExplanation(question) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        question: {
-          id: question.id,
-          number: question.number,
-          type: question.type,
-          stem: question.stem,
-          options: question.options,
-          correctOption: question.correctOption,
-          correctOptions: question.correctOptions,
-          explanations: question.explanations,
-          sourceExplanation: question.sourceExplanation,
-          explanationSource: question.explanationSource,
-        },
+        question: buildQuestionPayload(question),
       }),
     });
 
@@ -494,14 +643,7 @@ async function requestLiveExplanation(question) {
 
     const updated = body.question;
     if (updated && updated.id === question.id) {
-      question.explanations = updated.explanations || question.explanations || {};
-      question.explanationSource = updated.explanationSource || question.explanationSource;
-      if (updated.correctOption) {
-        question.correctOption = updated.correctOption;
-      }
-      if (Array.isArray(updated.correctOptions) && updated.correctOptions.length > 0) {
-        question.correctOptions = updated.correctOptions;
-      }
+      mergeUpdatedQuestion(updated);
     }
   } catch (error) {
     state.explanationRequestError[question.id] = error.message || 'Unable to generate explanation right now.';
@@ -941,6 +1083,8 @@ function completeQuiz(reason = '') {
 function resetToUploadScreen() {
   stopClock();
   clearLocalImageMap();
+  state.explanationBackfillToken += 1;
+  state.explanationBackfillRunning = false;
   state.quiz = null;
   state.currentIndex = 0;
   state.answers = {};
@@ -956,6 +1100,7 @@ function resetToUploadScreen() {
   state.explanationRequestInFlight = {};
   state.explanationRequestTried = {};
   state.explanationRequestError = {};
+  state.explanationBackfillAttempts = {};
 
   dom.documentInput.value = '';
   setSelectedFileName(null);
@@ -1391,6 +1536,8 @@ async function requestJsonWithProgress(url, requestOptions, onUploadProgress) {
 }
 
 function applyQuizToState(body, localImageMap = {}) {
+  state.explanationBackfillToken += 1;
+  state.explanationBackfillRunning = false;
   state.quiz = body.quiz;
   state.currentIndex = 0;
   state.answers = {};
@@ -1405,6 +1552,7 @@ function applyQuizToState(body, localImageMap = {}) {
   state.explanationRequestInFlight = {};
   state.explanationRequestTried = {};
   state.explanationRequestError = {};
+  state.explanationBackfillAttempts = {};
 
   state.timedMode = dom.timedMode.checked;
   state.tutorMode = dom.tutorMode.checked;
@@ -1534,6 +1682,7 @@ async function uploadDocument(event) {
 
     setStatus(parts.join(' '), 'success');
     renderAll();
+    void backfillMissingExplanations();
   } catch (error) {
     hideUploadProgress();
     setStatus(error.message || 'Unable to process file.', 'error');

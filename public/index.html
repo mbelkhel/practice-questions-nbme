@@ -44,14 +44,9 @@
 
           <button id="upload-btn" type="submit" class="primary-btn">Generate Quiz</button>
 
-          <div id="upload-progress-wrap" class="upload-progress hidden">
-            <div class="upload-progress-head">
-              <span id="upload-progress-label">Preparing upload...</span>
-              <span id="upload-progress-value">0%</span>
-            </div>
-            <div class="upload-progress-track">
-              <div id="upload-progress-bar" class="upload-progress-bar"></div>
-            </div>
+          <div id="upload-progress-wrap" class="upload-progress hidden" role="status" aria-live="polite">
+            <div class="upload-spinner" aria-hidden="true"></div>
+            <div id="upload-progress-label" class="upload-progress-label">Preparing upload...</div>
           </div>
         </form>
 

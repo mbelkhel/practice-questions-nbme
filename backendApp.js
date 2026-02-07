@@ -95,6 +95,58 @@ function geminiGenerationOptions(singleQuestion = false) {
   };
 }
 
+function normalizeQuestionPayload(incoming) {
+  if (!incoming || typeof incoming !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    id: String(incoming.id || 'q-on-demand'),
+    number: Number.parseInt(String(incoming.number || '1'), 10) || 1,
+    type: String(incoming.type || 'single_select'),
+    stem: String(incoming.stem || '').trim(),
+    options: Array.isArray(incoming.options)
+      ? incoming.options
+          .map((option) => ({
+            label: String(option?.label || '').trim().toUpperCase(),
+            text: String(option?.text || '').trim(),
+          }))
+          .filter((option) => /^[A-F]$/.test(option.label) && option.text.length > 0)
+      : [],
+    correctOption: incoming.correctOption ? String(incoming.correctOption).trim().toUpperCase() : null,
+    correctOptions: Array.isArray(incoming.correctOptions)
+      ? incoming.correctOptions
+          .map((value) => String(value || '').trim().toUpperCase())
+          .filter((value) => /^[A-F]$/.test(value))
+      : [],
+    explanations: typeof incoming.explanations === 'object' && incoming.explanations ? { ...incoming.explanations } : {},
+    sourceExplanation: String(incoming.sourceExplanation || ''),
+    explanationSource: String(incoming.explanationSource || 'none'),
+  };
+
+  if (!normalized.stem || normalized.options.length < 2) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function fillQuestionExplanationFallbacks(question) {
+  for (const option of question.options) {
+    if (!question.explanations[option.label] || question.explanations[option.label].trim().length < 5) {
+      if (question.sourceExplanation) {
+        question.explanations[option.label] = question.sourceExplanation;
+        if (question.explanationSource === 'none') {
+          question.explanationSource = 'document';
+        }
+      } else {
+        question.explanations[option.label] =
+          'Explanation was not available in the source and could not be generated at this time.';
+      }
+    }
+  }
+}
+
 async function buildQuizResponseFromText(text, requestBody, fileName = '') {
   if (!text || text.trim().length < 30) {
     return {
@@ -115,19 +167,7 @@ async function buildQuizResponseFromText(text, requestBody, fileName = '') {
   const gemini = await enrichQuestionsWithGemini(quiz.questions, geminiGenerationOptions(false));
 
   for (const question of quiz.questions) {
-    for (const option of question.options) {
-      if (!question.explanations[option.label] || question.explanations[option.label].trim().length < 5) {
-        if (question.sourceExplanation) {
-          question.explanations[option.label] = question.sourceExplanation;
-          if (question.explanationSource === 'none') {
-            question.explanationSource = 'document';
-          }
-        } else {
-          question.explanations[option.label] =
-            'Explanation was not available in the source and could not be generated at this time.';
-        }
-      }
-    }
+    fillQuestionExplanationFallbacks(question);
   }
 
   const tutorModeDefault = toBool(requestBody?.tutorMode, true);
@@ -208,56 +248,14 @@ app.post('/api/quiz/from-text', async (req, res) => {
 
 app.post('/api/quiz/explain', async (req, res) => {
   try {
-    const incoming = req.body?.question;
-    if (!incoming || typeof incoming !== 'object') {
+    const question = normalizeQuestionPayload(req.body?.question);
+    if (!question) {
       res.status(400).json({ error: 'Missing question payload.' });
       return;
     }
 
-    const question = {
-      id: String(incoming.id || 'q-on-demand'),
-      number: Number.parseInt(String(incoming.number || '1'), 10) || 1,
-      type: String(incoming.type || 'single_select'),
-      stem: String(incoming.stem || '').trim(),
-      options: Array.isArray(incoming.options)
-        ? incoming.options
-            .map((option) => ({
-              label: String(option?.label || '').trim().toUpperCase(),
-              text: String(option?.text || '').trim(),
-            }))
-            .filter((option) => /^[A-F]$/.test(option.label) && option.text.length > 0)
-        : [],
-      correctOption: incoming.correctOption ? String(incoming.correctOption).trim().toUpperCase() : null,
-      correctOptions: Array.isArray(incoming.correctOptions)
-        ? incoming.correctOptions
-            .map((value) => String(value || '').trim().toUpperCase())
-            .filter((value) => /^[A-F]$/.test(value))
-        : [],
-      explanations: typeof incoming.explanations === 'object' && incoming.explanations ? { ...incoming.explanations } : {},
-      sourceExplanation: String(incoming.sourceExplanation || ''),
-      explanationSource: String(incoming.explanationSource || 'none'),
-    };
-
-    if (!question.stem || question.options.length < 2) {
-      res.status(400).json({ error: 'Question stem/options are invalid.' });
-      return;
-    }
-
     const gemini = await enrichQuestionsWithGemini([question], geminiGenerationOptions(true));
-
-    for (const option of question.options) {
-      if (!question.explanations[option.label] || question.explanations[option.label].trim().length < 5) {
-        if (question.sourceExplanation) {
-          question.explanations[option.label] = question.sourceExplanation;
-          if (question.explanationSource === 'none') {
-            question.explanationSource = 'document';
-          }
-        } else {
-          question.explanations[option.label] =
-            'Explanation was not available in the source and could not be generated at this time.';
-        }
-      }
-    }
+    fillQuestionExplanationFallbacks(question);
 
     res.json({
       question,
@@ -268,6 +266,48 @@ app.post('/api/quiz/explain', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: error.message || 'Failed to generate explanation.',
+    });
+  }
+});
+
+app.post('/api/quiz/explain-batch', async (req, res) => {
+  try {
+    const incomingQuestions = Array.isArray(req.body?.questions) ? req.body.questions : [];
+    if (!incomingQuestions.length) {
+      res.status(400).json({ error: 'Missing questions payload.' });
+      return;
+    }
+
+    const perRequestLimit = runningOnVercel ? 8 : 16;
+    const questions = incomingQuestions.slice(0, perRequestLimit).map(normalizeQuestionPayload).filter(Boolean);
+
+    if (!questions.length) {
+      res.status(400).json({ error: 'No valid questions supplied.' });
+      return;
+    }
+
+    const gemini = await enrichQuestionsWithGemini(questions, {
+      ...geminiGenerationOptions(false),
+      chunkSize: Math.min(questions.length, runningOnVercel ? 4 : 8),
+      maxQuestions: questions.length,
+      maxMilliseconds: runningOnVercel ? 55000 : 140000,
+    });
+
+    for (const question of questions) {
+      fillQuestionExplanationFallbacks(question);
+    }
+
+    res.json({
+      questions,
+      processing: {
+        gemini,
+        requested: incomingQuestions.length,
+        processed: questions.length,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.message || 'Failed to generate explanations.',
     });
   }
 });

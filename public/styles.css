@@ -163,32 +163,33 @@ code {
 }
 
 .upload-progress {
+  margin-top: 4px;
   display: grid;
-  gap: 6px;
+  justify-items: center;
+  gap: 8px;
+  padding: 8px 0 2px;
 }
 
-.upload-progress-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+.upload-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 4px solid #d3e3f2;
+  border-top-color: #1e70b3;
+  border-right-color: #2f88cb;
+  animation: upload-spin 0.8s linear infinite;
+}
+
+.upload-progress-label {
   color: #335472;
-  font-size: 0.87rem;
+  font-size: 0.9rem;
+  text-align: center;
 }
 
-.upload-progress-track {
-  width: 100%;
-  height: 11px;
-  background: #e0ebf5;
-  border: 1px solid #c4d5e6;
-  border-radius: 999px;
-  overflow: hidden;
-}
-
-.upload-progress-bar {
-  width: 0%;
-  height: 100%;
-  background: linear-gradient(90deg, #2f88cb 0%, #1f5f97 100%);
-  transition: width 120ms linear;
+@keyframes upload-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .status {
