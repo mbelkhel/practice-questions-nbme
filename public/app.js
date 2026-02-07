@@ -12,6 +12,8 @@ const DOCX_COMPRESSION_PASSES = [
   { label: 'ultra', maxDimension: 560, quality: 0.35, minSourceBytes: 1 },
 ];
 const FILE_PLACEHOLDER_TEXT = 'Drag and drop a file here, or click Choose File.';
+const EXPLANATION_FALLBACK_PHRASE = 'could not be generated at this time';
+const EXPLANATION_SOURCE_MISSING_PHRASE = 'not available in the source';
 
 const dom = {
   uploadSection: document.getElementById('upload-section'),
@@ -72,6 +74,9 @@ const state = {
   completionReason: '',
   processing: null,
   localImageMap: {},
+  explanationRequestInFlight: {},
+  explanationRequestTried: {},
+  explanationRequestError: {},
 };
 
 function escapeHtml(value) {
@@ -430,6 +435,82 @@ function explanationFor(question, label) {
   );
 }
 
+function isFallbackExplanationText(text) {
+  const normalized = String(text || '').trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  return normalized.includes(EXPLANATION_FALLBACK_PHRASE) || normalized.includes(EXPLANATION_SOURCE_MISSING_PHRASE);
+}
+
+function questionNeedsLiveExplanation(question) {
+  if (!question || !Array.isArray(question.options) || question.options.length < 2) {
+    return false;
+  }
+
+  return question.options.some((option) => isFallbackExplanationText(question.explanations?.[option.label]));
+}
+
+async function requestLiveExplanation(question) {
+  if (!question || !question.id) {
+    return;
+  }
+
+  if (state.explanationRequestInFlight[question.id] || state.explanationRequestTried[question.id]) {
+    return;
+  }
+
+  state.explanationRequestInFlight[question.id] = true;
+  state.explanationRequestTried[question.id] = true;
+  state.explanationRequestError[question.id] = '';
+  renderAll();
+
+  try {
+    const response = await fetch('/api/quiz/explain', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        question: {
+          id: question.id,
+          number: question.number,
+          type: question.type,
+          stem: question.stem,
+          options: question.options,
+          correctOption: question.correctOption,
+          correctOptions: question.correctOptions,
+          explanations: question.explanations,
+          sourceExplanation: question.sourceExplanation,
+          explanationSource: question.explanationSource,
+        },
+      }),
+    });
+
+    const body = parseResponseText(await response.text());
+    if (!response.ok) {
+      throw new Error(body.error || `Explanation generation failed (HTTP ${response.status}).`);
+    }
+
+    const updated = body.question;
+    if (updated && updated.id === question.id) {
+      question.explanations = updated.explanations || question.explanations || {};
+      question.explanationSource = updated.explanationSource || question.explanationSource;
+      if (updated.correctOption) {
+        question.correctOption = updated.correctOption;
+      }
+      if (Array.isArray(updated.correctOptions) && updated.correctOptions.length > 0) {
+        question.correctOptions = updated.correctOptions;
+      }
+    }
+  } catch (error) {
+    state.explanationRequestError[question.id] = error.message || 'Unable to generate explanation right now.';
+  } finally {
+    state.explanationRequestInFlight[question.id] = false;
+    renderAll();
+  }
+}
+
 function safeImageSrc(src) {
   const trimmed = String(src || '').trim();
   if (!trimmed) {
@@ -530,6 +611,8 @@ function renderExplanation(question) {
   }
 
   const lines = [];
+  const inFlight = Boolean(state.explanationRequestInFlight[question.id]);
+  const liveError = state.explanationRequestError[question.id] || '';
 
   if (showReviewExplanation || showTutorExplanation) {
     question.options.forEach((option) => {
@@ -543,12 +626,25 @@ function renderExplanation(question) {
     });
   }
 
+  if (inFlight) {
+    lines.unshift('<div class="expl-item"><em>Generating explanation...</em></div>');
+  }
+  if (liveError) {
+    lines.unshift(`<div class="expl-item"><em>${escapeHtml(liveError)}</em></div>`);
+  }
+
   dom.explanation.innerHTML = `
     <h3>Explanation</h3>
     ${lines.join('')}
     <div class="expl-source">Source: ${escapeHtml(question.explanationSource || 'none')}</div>
   `;
   dom.explanation.classList.remove('hidden');
+
+  if ((showTutorExplanation || showReviewExplanation) && questionNeedsLiveExplanation(question)) {
+    setTimeout(() => {
+      requestLiveExplanation(question);
+    }, 0);
+  }
 }
 
 function toggleStrike(questionId, optionLabel) {
@@ -857,6 +953,9 @@ function resetToUploadScreen() {
   state.processing = null;
   state.secondsLeft = null;
   state.elapsedSeconds = 0;
+  state.explanationRequestInFlight = {};
+  state.explanationRequestTried = {};
+  state.explanationRequestError = {};
 
   dom.documentInput.value = '';
   setSelectedFileName(null);
@@ -1303,6 +1402,9 @@ function applyQuizToState(body, localImageMap = {}) {
   state.completionReason = '';
   state.processing = body.processing;
   state.localImageMap = localImageMap || {};
+  state.explanationRequestInFlight = {};
+  state.explanationRequestTried = {};
+  state.explanationRequestError = {};
 
   state.timedMode = dom.timedMode.checked;
   state.tutorMode = dom.tutorMode.checked;

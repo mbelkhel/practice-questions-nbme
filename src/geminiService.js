@@ -1,6 +1,19 @@
 const { GoogleGenAI } = require('@google/genai');
 
-const DEFAULT_MODEL_CHAIN = ['gemini-2.5-flash-lite', 'gemini-3.0-flash', 'gemini-2.5-flash', 'gemma-3-12b-it'];
+const DEFAULT_MODEL_CHAIN = ['gemma-3-27b-it'];
+const EXPLANATION_PLACEHOLDER_PATTERNS = [
+  'could not be generated at this time',
+  'not available in the source',
+  'enable gemini with a valid api key',
+];
+
+function isPlaceholderExplanationText(text) {
+  const normalized = String(text || '').trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  return EXPLANATION_PLACEHOLDER_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
 
 function chunkArray(items, size) {
   const chunks = [];
@@ -181,7 +194,12 @@ function hasSufficientExplanations(question) {
 
   for (const option of question.options) {
     const explanation = question.explanations?.[option.label] || '';
-    if (explanation.trim().length < 25) {
+    const normalized = explanation.trim();
+    if (normalized.length < 25) {
+      return false;
+    }
+
+    if (isPlaceholderExplanationText(explanation)) {
       return false;
     }
   }
@@ -250,7 +268,7 @@ function mergeAiResultIntoQuestion(question, generated) {
     }
 
     const current = question.explanations[option.label] || '';
-    if (current.trim().length >= 25) {
+    if (current.trim().length >= 25 && !isPlaceholderExplanationText(current)) {
       continue;
     }
 
@@ -338,7 +356,7 @@ async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
 async function enrichQuestionsWithGemini(questions, options = {}) {
   const apiKey = options.apiKey || process.env.GEMINI_API_KEY;
   const models = buildModelChain(options);
-  const initialModel = models[0] || 'gemini-2.5-flash-lite';
+  const initialModel = models[0] || 'gemma-3-27b-it';
   const chunkSize = Number.parseInt(String(options.chunkSize || process.env.GEMINI_CHUNK_SIZE || '3'), 10);
   const perChunkTimeoutMs = Number.parseInt(
     String(options.perChunkTimeoutMs || process.env.GEMINI_CHUNK_TIMEOUT_MS || '12000'),
@@ -374,7 +392,7 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
   const skippedQuestions = Math.max(0, targets.length - limitedTargets.length);
 
   const ai = new GoogleGenAI({ apiKey });
-  const chunks = chunkArray(limitedTargets, Math.max(1, chunkSize));
+  const pendingChunks = chunkArray(limitedTargets, Math.max(1, chunkSize));
 
   let updatedQuestions = 0;
   let failures = 0;
@@ -390,7 +408,12 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
   const triedModels = [activeModel];
   const startedAt = Date.now();
 
-  chunkLoop: for (const chunk of chunks) {
+  while (pendingChunks.length > 0) {
+    const chunk = pendingChunks.shift();
+    if (!chunk || chunk.length === 0) {
+      continue;
+    }
+
     while (true) {
       activeModel = models[Math.min(modelIndex, models.length - 1)] || initialModel;
 
@@ -399,7 +422,8 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
 
       if (remainingMs <= 1500) {
         timedOut = true;
-        break chunkLoop;
+        pendingChunks.length = 0;
+        break;
       }
 
       const timeoutMs = Math.max(1500, Math.min(perChunkTimeoutMs, remainingMs - 250));
@@ -428,9 +452,16 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
         break;
       } catch (error) {
         if (error && error.code === 'GEMINI_TIMEOUT') {
+          if (chunk.length > 1) {
+            const mid = Math.ceil(chunk.length / 2);
+            pendingChunks.unshift(chunk.slice(mid));
+            pendingChunks.unshift(chunk.slice(0, mid));
+            break;
+          }
+
           failures += 1;
           timedOut = true;
-          break chunkLoop;
+          break;
         }
 
         const canFallback = modelIndex < models.length - 1;
@@ -458,13 +489,22 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
         if (error && error.code === 'GEMINI_AUTH') {
           failures += 1;
           authFailed = true;
-          break chunkLoop;
+          pendingChunks.length = 0;
+          break;
         }
 
         if (shouldFallback && !canFallback) {
+          if (chunk.length > 1 && error.code !== 'GEMINI_RATE_LIMIT') {
+            const mid = Math.ceil(chunk.length / 2);
+            pendingChunks.unshift(chunk.slice(mid));
+            pendingChunks.unshift(chunk.slice(0, mid));
+            break;
+          }
+
           failures += 1;
           exhaustedModels = true;
-          break chunkLoop;
+          pendingChunks.length = 0;
+          break;
         }
 
         failures += 1;

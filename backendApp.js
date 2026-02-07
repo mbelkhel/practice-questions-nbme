@@ -73,6 +73,28 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+function geminiGenerationOptions(singleQuestion = false) {
+  if (singleQuestion) {
+    return {
+      model: 'gemma-3-27b-it',
+      modelChain: ['gemma-3-27b-it'],
+      chunkSize: 1,
+      perChunkTimeoutMs: runningOnVercel ? 50000 : 80000,
+      maxMilliseconds: runningOnVercel ? 55000 : 120000,
+      maxQuestions: 1,
+    };
+  }
+
+  return {
+    model: 'gemma-3-27b-it',
+    modelChain: ['gemma-3-27b-it'],
+    chunkSize: runningOnVercel ? 8 : 12,
+    perChunkTimeoutMs: runningOnVercel ? 12000 : 18000,
+    maxMilliseconds: runningOnVercel ? 52000 : 170000,
+    maxQuestions: runningOnVercel ? 180 : 240,
+  };
+}
+
 async function buildQuizResponseFromText(text, requestBody, fileName = '') {
   if (!text || text.trim().length < 30) {
     return {
@@ -90,14 +112,7 @@ async function buildQuizResponseFromText(text, requestBody, fileName = '') {
     };
   }
 
-  const gemini = await enrichQuestionsWithGemini(quiz.questions, {
-    model: 'gemini-3.0-flash',
-    modelChain: ['gemini-3.0-flash', 'gemini-2.5-flash', 'gemma-3-12b-it'],
-    chunkSize: runningOnVercel ? 20 : 28,
-    perChunkTimeoutMs: runningOnVercel ? 14000 : 22000,
-    maxMilliseconds: runningOnVercel ? 52000 : 170000,
-    maxQuestions: runningOnVercel ? 180 : 240,
-  });
+  const gemini = await enrichQuestionsWithGemini(quiz.questions, geminiGenerationOptions(false));
 
   for (const question of quiz.questions) {
     for (const option of question.options) {
@@ -187,6 +202,72 @@ app.post('/api/quiz/from-text', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: error.message || 'Failed to process text payload.',
+    });
+  }
+});
+
+app.post('/api/quiz/explain', async (req, res) => {
+  try {
+    const incoming = req.body?.question;
+    if (!incoming || typeof incoming !== 'object') {
+      res.status(400).json({ error: 'Missing question payload.' });
+      return;
+    }
+
+    const question = {
+      id: String(incoming.id || 'q-on-demand'),
+      number: Number.parseInt(String(incoming.number || '1'), 10) || 1,
+      type: String(incoming.type || 'single_select'),
+      stem: String(incoming.stem || '').trim(),
+      options: Array.isArray(incoming.options)
+        ? incoming.options
+            .map((option) => ({
+              label: String(option?.label || '').trim().toUpperCase(),
+              text: String(option?.text || '').trim(),
+            }))
+            .filter((option) => /^[A-F]$/.test(option.label) && option.text.length > 0)
+        : [],
+      correctOption: incoming.correctOption ? String(incoming.correctOption).trim().toUpperCase() : null,
+      correctOptions: Array.isArray(incoming.correctOptions)
+        ? incoming.correctOptions
+            .map((value) => String(value || '').trim().toUpperCase())
+            .filter((value) => /^[A-F]$/.test(value))
+        : [],
+      explanations: typeof incoming.explanations === 'object' && incoming.explanations ? { ...incoming.explanations } : {},
+      sourceExplanation: String(incoming.sourceExplanation || ''),
+      explanationSource: String(incoming.explanationSource || 'none'),
+    };
+
+    if (!question.stem || question.options.length < 2) {
+      res.status(400).json({ error: 'Question stem/options are invalid.' });
+      return;
+    }
+
+    const gemini = await enrichQuestionsWithGemini([question], geminiGenerationOptions(true));
+
+    for (const option of question.options) {
+      if (!question.explanations[option.label] || question.explanations[option.label].trim().length < 5) {
+        if (question.sourceExplanation) {
+          question.explanations[option.label] = question.sourceExplanation;
+          if (question.explanationSource === 'none') {
+            question.explanationSource = 'document';
+          }
+        } else {
+          question.explanations[option.label] =
+            'Explanation was not available in the source and could not be generated at this time.';
+        }
+      }
+    }
+
+    res.json({
+      question,
+      processing: {
+        gemini,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error.message || 'Failed to generate explanation.',
     });
   }
 });
