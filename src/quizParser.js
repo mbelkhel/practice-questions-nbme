@@ -112,6 +112,186 @@ function parseUnlabeledTrailingOptions(lines) {
   return { stem: normalizeWhitespace(nonEmpty.join('\n')), options: [] };
 }
 
+function createQuestionFromParts(number, stem, options, embeddedAnswer = null) {
+  const extractedStem = extractImageRefs(stem);
+  const imageRefs = [...extractedStem.images];
+  const cleanStem = extractedStem.text;
+
+  const cleanOptions = options.map((option) => {
+    const extractedOption = extractImageRefs(option.text);
+    for (const source of extractedOption.images) {
+      maybePushImage(imageRefs, source);
+    }
+
+    return {
+      ...option,
+      text: extractedOption.text,
+    };
+  });
+
+  return {
+    id: `q-${number}`,
+    number,
+    stem: normalizeWhitespace(cleanStem),
+    stemHtml: null,
+    images: imageRefs,
+    options: cleanOptions,
+    correctOption: embeddedAnswer,
+    explanations: {},
+    sourceExplanation: '',
+    explanationSource: 'none',
+  };
+}
+
+function isImageMarkerLine(line) {
+  return /^\[IMAGE:/i.test(line);
+}
+
+function isLikelyQuestionStartLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || isImageMarkerLine(trimmed)) {
+    return false;
+  }
+
+  if (/^(?:question\s+\d+|q\d+)/i.test(trimmed)) {
+    return true;
+  }
+
+  if (/^(?:a|an)\s+\d{1,3}-year-old\b/i.test(trimmed)) {
+    return true;
+  }
+
+  if (/^(?:what|which|in the|next step|true or false|place the)\b/i.test(trimmed)) {
+    return true;
+  }
+
+  if (/[?:]$/.test(trimmed) && trimmed.length >= 35) {
+    return true;
+  }
+
+  return false;
+}
+
+function looksLikeOptionText(line) {
+  const trimmed = line.trim();
+  if (!trimmed || isImageMarkerLine(trimmed)) {
+    return false;
+  }
+
+  if (/^answers?$/i.test(trimmed)) {
+    return false;
+  }
+
+  if (isLikelyQuestionStartLine(trimmed)) {
+    return false;
+  }
+
+  if (trimmed.length > 180) {
+    return false;
+  }
+
+  return true;
+}
+
+function stripLeadingOptionMarker(text) {
+  return text.replace(/^\(?[A-F]\)?[).:\-]\s+/i, '').trim();
+}
+
+function parseUnnumberedQuestionBlocks(questionSection) {
+  const rawLines = questionSection.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (!rawLines.length) {
+    return [];
+  }
+
+  let lines = rawLines;
+  if (rawLines.length > 1 && !isLikelyQuestionStartLine(rawLines[0]) && isLikelyQuestionStartLine(rawLines[1])) {
+    lines = rawLines.slice(1);
+  }
+
+  const questions = [];
+  let cursor = 0;
+  let number = 1;
+
+  while (cursor < lines.length) {
+    while (cursor < lines.length && !isLikelyQuestionStartLine(lines[cursor])) {
+      cursor += 1;
+    }
+
+    if (cursor >= lines.length) {
+      break;
+    }
+
+    const stemLines = [lines[cursor]];
+    cursor += 1;
+
+    while (cursor < lines.length) {
+      const nextLine = lines[cursor];
+
+      if (isImageMarkerLine(nextLine)) {
+        stemLines.push(nextLine);
+        cursor += 1;
+        continue;
+      }
+
+      if (looksLikeOptionText(nextLine)) {
+        break;
+      }
+
+      if (isLikelyQuestionStartLine(nextLine) && stemLines.some((line) => /[?:]$/.test(line))) {
+        break;
+      }
+
+      stemLines.push(nextLine);
+      cursor += 1;
+    }
+
+    const optionLines = [];
+    while (cursor < lines.length) {
+      const nextLine = lines[cursor];
+
+      if (isImageMarkerLine(nextLine)) {
+        stemLines.push(nextLine);
+        cursor += 1;
+        continue;
+      }
+
+      if (optionLines.length >= 2 && isLikelyQuestionStartLine(nextLine)) {
+        break;
+      }
+
+      if (!looksLikeOptionText(nextLine)) {
+        if (optionLines.length >= 2) {
+          break;
+        }
+        cursor += 1;
+        continue;
+      }
+
+      optionLines.push(nextLine);
+      cursor += 1;
+
+      if (optionLines.length >= OPTION_LABELS.length) {
+        break;
+      }
+    }
+
+    if (optionLines.length >= 2) {
+      const options = optionLines.slice(0, OPTION_LABELS.length).map((text, idx) => ({
+        label: OPTION_LABELS[idx],
+        text: normalizeWhitespace(stripLeadingOptionMarker(text)),
+      }));
+
+      const stem = normalizeWhitespace(stemLines.join('\n'));
+      const question = createQuestionFromParts(number, stem, options, null);
+      questions.push(question);
+      number += 1;
+      continue;
+    }
+  }
+
+  return questions;
+}
+
 function parseQuestionBlock(number, blockText) {
   const text = blockText.trim();
   const lines = text.split('\n');
@@ -189,34 +369,7 @@ function parseQuestionBlock(number, blockText) {
     embeddedAnswer = answerInBlock[1].toUpperCase();
   }
 
-  const extractedStem = extractImageRefs(stem);
-  const imageRefs = [...extractedStem.images];
-  stem = extractedStem.text;
-
-  options = options.map((option) => {
-    const extractedOption = extractImageRefs(option.text);
-    for (const source of extractedOption.images) {
-      maybePushImage(imageRefs, source);
-    }
-
-    return {
-      ...option,
-      text: extractedOption.text,
-    };
-  });
-
-  return {
-    id: `q-${number}`,
-    number,
-    stem: normalizeWhitespace(stem),
-    stemHtml: null,
-    images: imageRefs,
-    options,
-    correctOption: embeddedAnswer,
-    explanations: {},
-    sourceExplanation: '',
-    explanationSource: 'none',
-  };
+  return createQuestionFromParts(number, stem, options, embeddedAnswer);
 }
 
 function splitQuestionAndAnswerSections(rawText) {
@@ -284,6 +437,10 @@ function parseQuestions(questionSection) {
     matches = [...questionSection.matchAll(numericRegex)];
   }
 
+  if (matches.length === 0) {
+    return parseUnnumberedQuestionBlocks(questionSection);
+  }
+
   for (const match of matches) {
     const number = Number.parseInt(match[1], 10);
     const blockText = normalizeWhitespace(match[2]);
@@ -295,6 +452,69 @@ function parseQuestions(questionSection) {
   }
 
   return questions;
+}
+
+function parseSequentialAnswerSection(answerSection, questions) {
+  const answerMap = new Map();
+
+  if (!answerSection || !questions.length) {
+    return answerMap;
+  }
+
+  const lines = normalizeWhitespace(answerSection)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const startIdx = lines.findIndex((line) => /^answers?$/i.test(line));
+  const candidateLines = (startIdx >= 0 ? lines.slice(startIdx + 1) : lines).map((line) => line.trim());
+
+  function pickOptionForBoolean(question, boolValue) {
+    const boolText = boolValue.toLowerCase();
+    const matched = question.options.find((option) =>
+      new RegExp(`^\\s*☐?\\s*${boolText}\\b`, 'i').test(option.text),
+    );
+    if (matched) {
+      return matched.label;
+    }
+
+    return boolValue === 'TRUE' ? 'A' : 'B';
+  }
+
+  function parseTokenToOption(rawToken, question) {
+    const token = rawToken.trim().toUpperCase();
+
+    if (/^(?:[A-F](?:\s*,\s*[A-F])*)$/.test(token)) {
+      return token.split(',')[0].trim();
+    }
+
+    if (/^(TRUE|FALSE)$/.test(token)) {
+      return pickOptionForBoolean(question, token);
+    }
+
+    return null;
+  }
+
+  let questionIdx = 0;
+  for (const line of candidateLines) {
+    if (questionIdx >= questions.length) {
+      break;
+    }
+
+    const question = questions[questionIdx];
+    const option = parseTokenToOption(line, question);
+    if (!option) {
+      continue;
+    }
+
+    answerMap.set(question.number, {
+      correctOption: option,
+      explanation: '',
+    });
+    questionIdx += 1;
+  }
+
+  return answerMap;
 }
 
 function parseAnswerSection(answerSection) {
@@ -398,6 +618,16 @@ function buildQuizFromText(rawText) {
   const questions = parseQuestions(questionSection);
 
   const answerMap = parseAnswerSection(answerSection);
+  const hasDirectMappedAnswers = [...answerMap.values()].some((answer) => Boolean(answer.correctOption));
+
+  if (!hasDirectMappedAnswers) {
+    answerMap.clear();
+    const sequentialAnswerMap = parseSequentialAnswerSection(answerSection, questions);
+    for (const [number, answer] of sequentialAnswerMap.entries()) {
+      answerMap.set(number, answer);
+    }
+  }
+
   applyAnswersToQuestions(questions, answerMap);
 
   const inferredTitle = questionSection

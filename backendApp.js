@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const fs = require('fs/promises');
 const fsSync = require('fs');
+const os = require('os');
 const path = require('path');
 const express = require('express');
 const multer = require('multer');
@@ -13,7 +14,9 @@ const { enrichQuestionsWithGemini } = require('./src/geminiService');
 const app = express();
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 
-const uploadDir = process.env.VERCEL ? '/tmp/uploads' : path.join(__dirname, 'uploads');
+const runningOnVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV || process.env.NOW_REGION);
+const uploadDir = runningOnVercel ? path.join(os.tmpdir(), 'uploads') : path.join(__dirname, 'uploads');
+const maxUploadBytes = runningOnVercel ? 4 * 1024 * 1024 : 25 * 1024 * 1024;
 fsSync.mkdirSync(uploadDir, { recursive: true });
 
 function toBool(value, defaultValue = false) {
@@ -48,7 +51,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 25 * 1024 * 1024,
+    fileSize: maxUploadBytes,
   },
   fileFilter: (req, file, cb) => {
     if (!allowedFile(file)) {
@@ -158,6 +161,14 @@ app.post('/api/quiz/upload', upload.single('document'), async (req, res) => {
 });
 
 app.use((error, req, res, next) => {
+  if (error && error.code === 'LIMIT_FILE_SIZE') {
+    const limitMb = Math.floor(maxUploadBytes / (1024 * 1024));
+    res.status(413).json({
+      error: `Uploaded file is too large. Max size is ${limitMb}MB in this deployment.`,
+    });
+    return;
+  }
+
   res.status(400).json({
     error: error.message || 'Upload failed.',
   });

@@ -605,9 +605,18 @@ async function uploadDocument(event) {
       body: formData,
     });
 
-    const body = await response.json();
+    const rawBody = await response.text();
+    let body = {};
+    if (rawBody) {
+      try {
+        body = JSON.parse(rawBody);
+      } catch (error) {
+        throw new Error(rawBody.slice(0, 240));
+      }
+    }
+
     if (!response.ok) {
-      throw new Error(body.error || 'Upload failed.');
+      throw new Error(body.error || `Upload failed (HTTP ${response.status}).`);
     }
 
     state.quiz = body.quiz;
