@@ -1,6 +1,6 @@
 const { GoogleGenAI } = require('@google/genai');
 
-const DEFAULT_MODEL_CHAIN = ['gemma-3-27b-it'];
+const DEFAULT_MODEL_CHAIN = ['gemma-3-27b-it', 'gemma-3-12b-it'];
 const EXPLANATION_PLACEHOLDER_PATTERNS = [
   'could not be generated at this time',
   'not available in the source',

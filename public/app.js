@@ -14,9 +14,9 @@ const DOCX_COMPRESSION_PASSES = [
 const FILE_PLACEHOLDER_TEXT = 'Drag and drop a file here, or click Choose File.';
 const EXPLANATION_FALLBACK_PHRASE = 'could not be generated at this time';
 const EXPLANATION_SOURCE_MISSING_PHRASE = 'not available in the source';
-const EXPLANATION_BATCH_SIZE = 6;
+const EXPLANATION_BATCH_SIZE = 8;
 const EXPLANATION_BATCH_MAX_ATTEMPTS = 3;
-const EXPLANATION_BATCH_DELAY_MS = 180;
+const EXPLANATION_BATCH_DELAY_MS = 2400;
 
 const dom = {
   uploadSection: document.getElementById('upload-section'),

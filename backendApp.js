@@ -77,7 +77,7 @@ function geminiGenerationOptions(singleQuestion = false) {
   if (singleQuestion) {
     return {
       model: 'gemma-3-27b-it',
-      modelChain: ['gemma-3-27b-it'],
+      modelChain: ['gemma-3-27b-it', 'gemma-3-12b-it'],
       chunkSize: 1,
       perChunkTimeoutMs: runningOnVercel ? 50000 : 80000,
       maxMilliseconds: runningOnVercel ? 55000 : 120000,
@@ -87,11 +87,11 @@ function geminiGenerationOptions(singleQuestion = false) {
 
   return {
     model: 'gemma-3-27b-it',
-    modelChain: ['gemma-3-27b-it'],
-    chunkSize: runningOnVercel ? 8 : 12,
+    modelChain: ['gemma-3-27b-it', 'gemma-3-12b-it'],
+    chunkSize: runningOnVercel ? 10 : 12,
     perChunkTimeoutMs: runningOnVercel ? 12000 : 18000,
     maxMilliseconds: runningOnVercel ? 52000 : 170000,
-    maxQuestions: runningOnVercel ? 180 : 240,
+    maxQuestions: runningOnVercel ? 16 : 240,
   };
 }
 
@@ -288,7 +288,7 @@ app.post('/api/quiz/explain-batch', async (req, res) => {
 
     const gemini = await enrichQuestionsWithGemini(questions, {
       ...geminiGenerationOptions(false),
-      chunkSize: Math.min(questions.length, runningOnVercel ? 4 : 8),
+      chunkSize: Math.min(questions.length, runningOnVercel ? 8 : 12),
       maxQuestions: questions.length,
       maxMilliseconds: runningOnVercel ? 55000 : 140000,
     });
