@@ -1,5 +1,7 @@
 const { GoogleGenAI } = require('@google/genai');
 
+const DEFAULT_MODEL_CHAIN = ['gemini-2.5-flash-lite', 'gemini-3.0-flash', 'gemini-2.5-flash', 'gemma-3-12b-it'];
+
 function chunkArray(items, size) {
   const chunks = [];
   for (let i = 0; i < items.length; i += size) {
@@ -43,6 +45,55 @@ function extractJson(text) {
   }
 
   return null;
+}
+
+function parseModelChain(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildModelChain(options = {}) {
+  const fromOption = parseModelChain(options.modelChain);
+  const fromEnv = parseModelChain(process.env.GEMINI_MODEL_CHAIN);
+  const baseChain = fromOption.length > 0 ? fromOption : fromEnv.length > 0 ? fromEnv : DEFAULT_MODEL_CHAIN;
+  const preferred = String(options.model || process.env.GEMINI_MODEL || '').trim();
+  const chain = preferred ? [preferred, ...baseChain] : [...baseChain];
+
+  const unique = [];
+  for (const model of chain) {
+    if (!model || unique.includes(model)) {
+      continue;
+    }
+    unique.push(model);
+  }
+  return unique;
+}
+
+function isRateLimitError(error) {
+  const pieces = [
+    error?.code,
+    error?.status,
+    error?.error?.status,
+    error?.message,
+    error?.error?.message,
+    error?.details,
+  ]
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase());
+
+  return pieces.some((value) => {
+    return (
+      value.includes('429') ||
+      value.includes('resource_exhausted') ||
+      value.includes('rate limit') ||
+      value.includes('quota')
+    );
+  });
 }
 
 function normalizeOptionLabels(value) {
@@ -188,6 +239,11 @@ async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
       timeoutError.code = 'GEMINI_TIMEOUT';
       throw timeoutError;
     }
+    if (isRateLimitError(error)) {
+      const rateLimitError = new Error('Gemini rate limit reached for current model.');
+      rateLimitError.code = 'GEMINI_RATE_LIMIT';
+      throw rateLimitError;
+    }
     throw error;
   } finally {
     clearTimeout(timer);
@@ -204,7 +260,8 @@ async function generateChunk(ai, model, chunk, timeoutMs = 12000) {
 
 async function enrichQuestionsWithGemini(questions, options = {}) {
   const apiKey = options.apiKey || process.env.GEMINI_API_KEY;
-  const model = options.model || process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const models = buildModelChain(options);
+  const initialModel = models[0] || 'gemini-2.5-flash-lite';
   const chunkSize = Number.parseInt(String(options.chunkSize || process.env.GEMINI_CHUNK_SIZE || '3'), 10);
   const perChunkTimeoutMs = Number.parseInt(
     String(options.perChunkTimeoutMs || process.env.GEMINI_CHUNK_TIMEOUT_MS || '12000'),
@@ -246,44 +303,73 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
   let failures = 0;
   let processedQuestions = 0;
   let timedOut = false;
+  let exhaustedModels = false;
+  let modelIndex = 0;
+  let activeModel = initialModel;
+  let fallbackCount = 0;
+  const triedModels = [activeModel];
   const startedAt = Date.now();
 
-  for (const chunk of chunks) {
-    const elapsedMs = Date.now() - startedAt;
-    const remainingMs = maxMilliseconds - elapsedMs;
+  chunkLoop: for (const chunk of chunks) {
+    while (true) {
+      activeModel = models[Math.min(modelIndex, models.length - 1)] || initialModel;
 
-    if (remainingMs <= 1500) {
-      timedOut = true;
-      break;
-    }
+      const elapsedMs = Date.now() - startedAt;
+      const remainingMs = maxMilliseconds - elapsedMs;
 
-    const timeoutMs = Math.max(1500, Math.min(perChunkTimeoutMs, remainingMs - 250));
+      if (remainingMs <= 1500) {
+        timedOut = true;
+        break chunkLoop;
+      }
 
-    try {
-      const generatedItems = await generateChunk(ai, model, chunk, timeoutMs);
-      const generatedByNumber = new Map();
+      const timeoutMs = Math.max(1500, Math.min(perChunkTimeoutMs, remainingMs - 250));
 
-      for (const item of generatedItems) {
-        if (!item || typeof item.number !== 'number') {
+      try {
+        const generatedItems = await generateChunk(ai, activeModel, chunk, timeoutMs);
+        const generatedByNumber = new Map();
+
+        for (const item of generatedItems) {
+          if (!item || typeof item.number !== 'number') {
+            continue;
+          }
+          generatedByNumber.set(item.number, item);
+        }
+
+        for (const question of chunk) {
+          const before = JSON.stringify(question.explanations);
+          mergeAiResultIntoQuestion(question, generatedByNumber.get(question.number));
+          const after = JSON.stringify(question.explanations);
+          if (before !== after) {
+            updatedQuestions += 1;
+          }
+        }
+
+        processedQuestions += chunk.length;
+        break;
+      } catch (error) {
+        if (error && error.code === 'GEMINI_TIMEOUT') {
+          failures += 1;
+          timedOut = true;
+          break chunkLoop;
+        }
+
+        if (error && error.code === 'GEMINI_RATE_LIMIT' && modelIndex < models.length - 1) {
+          modelIndex += 1;
+          fallbackCount += 1;
+          const nextModel = models[modelIndex];
+          if (nextModel && !triedModels.includes(nextModel)) {
+            triedModels.push(nextModel);
+          }
           continue;
         }
-        generatedByNumber.set(item.number, item);
-      }
 
-      for (const question of chunk) {
-        const before = JSON.stringify(question.explanations);
-        mergeAiResultIntoQuestion(question, generatedByNumber.get(question.number));
-        const after = JSON.stringify(question.explanations);
-        if (before !== after) {
-          updatedQuestions += 1;
+        if (error && error.code === 'GEMINI_RATE_LIMIT' && modelIndex >= models.length - 1) {
+          failures += 1;
+          exhaustedModels = true;
+          break chunkLoop;
         }
-      }
 
-      processedQuestions += chunk.length;
-    } catch (error) {
-      failures += 1;
-      if (error && error.code === 'GEMINI_TIMEOUT') {
-        timedOut = true;
+        failures += 1;
         break;
       }
     }
@@ -296,13 +382,22 @@ async function enrichQuestionsWithGemini(questions, options = {}) {
   if (timedOut) {
     reasonParts.push('Stopped early due to runtime budget.');
   }
+  if (fallbackCount > 0) {
+    reasonParts.push(`Rate-limit fallback used ${fallbackCount} time(s); active model: ${activeModel}.`);
+  }
+  if (exhaustedModels) {
+    reasonParts.push('All fallback models were rate-limited.');
+  }
   if (failures > 0) {
     reasonParts.push(`${failures} chunk(s) failed.`);
   }
 
   return {
     attempted: true,
-    model,
+    model: activeModel,
+    modelChain: models,
+    triedModels,
+    rateLimitFallbacks: fallbackCount,
     updatedQuestions,
     failedChunks: failures,
     processedQuestions,

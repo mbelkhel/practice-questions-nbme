@@ -90,7 +90,7 @@ async function buildQuizResponseFromText(text, requestBody, fileName = '') {
     };
   }
 
-  const useGemini = toBool(requestBody?.useGemini, false);
+  const useGemini = toBool(requestBody?.useGemini, true);
   let gemini = {
     attempted: false,
     updatedQuestions: 0,
