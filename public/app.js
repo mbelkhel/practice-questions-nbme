@@ -1,6 +1,13 @@
 const SECONDS_PER_QUESTION = 90;
+const MB = 1024 * 1024;
+// Vercel Function request/response payload hard limit is 4.5MB.
+const VERCEL_HARD_REQUEST_LIMIT_BYTES = 4.5 * MB;
+const SERVER_UPLOAD_LIMIT_BYTES = 4 * MB;
+const FRONTEND_SAFE_UPLOAD_BYTES = 3.8 * MB;
+const ALLOWED_FILE_EXTENSIONS = ['.pdf', '.docx', '.doc', '.txt', '.md'];
 
 const dom = {
+  uploadSection: document.getElementById('upload-section'),
   uploadForm: document.getElementById('upload-form'),
   documentInput: document.getElementById('document-input'),
   timedMode: document.getElementById('timed-mode'),
@@ -29,6 +36,7 @@ const dom = {
   prevBtn: document.getElementById('prev-btn'),
   nextBtn: document.getElementById('next-btn'),
   finishBtn: document.getElementById('finish-btn'),
+  newTestBtn: document.getElementById('new-test-btn'),
   summary: document.getElementById('summary'),
 };
 
@@ -80,6 +88,27 @@ function formatClock(totalSeconds) {
   }
 
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes) || 0;
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < MB) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / MB).toFixed(2)} MB`;
+}
+
+function extensionOf(fileName) {
+  const name = String(fileName || '').trim().toLowerCase();
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot) : '';
+}
+
+function canCompressDocx(file) {
+  return extensionOf(file?.name) === '.docx';
 }
 
 function currentQuestion() {
@@ -140,34 +169,6 @@ function applySelectionHighlight() {
   saveStemMarkup();
 }
 
-function startClock() {
-  stopClock();
-  state.elapsedSeconds = 0;
-  state.secondsLeft = state.timedMode ? state.quiz.questions.length * SECONDS_PER_QUESTION : null;
-  updateClockDisplay();
-
-  state.timerId = setInterval(() => {
-    if (state.completed) {
-      return;
-    }
-
-    state.elapsedSeconds += 1;
-
-    if (state.timedMode && typeof state.secondsLeft === 'number') {
-      state.secondsLeft -= 1;
-
-      if (state.secondsLeft <= 0) {
-        state.secondsLeft = 0;
-        updateClockDisplay();
-        completeQuiz('time');
-        return;
-      }
-    }
-
-    updateClockDisplay();
-  }, 1000);
-}
-
 function stopClock() {
   if (state.timerId) {
     clearInterval(state.timerId);
@@ -175,15 +176,71 @@ function stopClock() {
   }
 }
 
+function shouldClockRun() {
+  if (!state.quiz || state.completed) {
+    return false;
+  }
+
+  if (!state.tutorMode) {
+    return true;
+  }
+
+  const question = currentQuestion();
+  if (!question) {
+    return false;
+  }
+
+  return !Boolean(state.submittedTutor[question.id]);
+}
+
+function tickClock() {
+  if (!shouldClockRun()) {
+    return;
+  }
+
+  state.elapsedSeconds += 1;
+
+  if (state.timedMode && typeof state.secondsLeft === 'number') {
+    state.secondsLeft -= 1;
+
+    if (state.secondsLeft <= 0) {
+      state.secondsLeft = 0;
+      updateClockDisplay();
+      completeQuiz('time');
+      return;
+    }
+  }
+
+  updateClockDisplay();
+}
+
+function startClock() {
+  stopClock();
+  state.elapsedSeconds = 0;
+  state.secondsLeft = state.timedMode ? state.quiz.questions.length * SECONDS_PER_QUESTION : null;
+  updateClockDisplay();
+  syncClockState();
+}
+
+function syncClockState() {
+  if (shouldClockRun()) {
+    if (!state.timerId) {
+      state.timerId = setInterval(tickClock, 1000);
+    }
+  } else {
+    stopClock();
+  }
+}
+
 function updateClockDisplay() {
   dom.stopwatch.textContent = formatClock(state.elapsedSeconds);
 
   if (state.timedMode) {
-    dom.timerLabel.textContent = 'Time Remaining';
+    dom.timerLabel.textContent = state.tutorMode && !shouldClockRun() ? 'Time Remaining (Paused)' : 'Time Remaining';
     dom.timer.textContent = formatClock(state.secondsLeft || 0);
     dom.timer.classList.toggle('warn', (state.secondsLeft || 0) <= 300);
   } else {
-    dom.timerLabel.textContent = 'Untimed Mode';
+    dom.timerLabel.textContent = state.tutorMode && !shouldClockRun() ? 'Untimed (Paused)' : 'Untimed Mode';
     dom.timer.textContent = '--:--';
     dom.timer.classList.remove('warn');
   }
@@ -291,7 +348,8 @@ function renderPalette() {
 
 function renderExplanation(question) {
   const selected = state.answers[question.id];
-  const showTutorExplanation = state.tutorMode && selected;
+  const tutorSubmitted = Boolean(state.submittedTutor[question.id]);
+  const showTutorExplanation = state.tutorMode && tutorSubmitted && selected;
   const showReviewExplanation = state.completed;
 
   if (!showTutorExplanation && !showReviewExplanation) {
@@ -302,7 +360,7 @@ function renderExplanation(question) {
 
   const lines = [];
 
-  if (showReviewExplanation) {
+  if (showReviewExplanation || showTutorExplanation) {
     question.options.forEach((option) => {
       const isCorrect = question.correctOption === option.label;
       const yourChoice = selected === option.label ? ' (Your choice)' : '';
@@ -312,21 +370,6 @@ function renderExplanation(question) {
         )}</div>`,
       );
     });
-  } else {
-    const selectedCorrect = selected === question.correctOption;
-    lines.push(
-      `<div class="expl-item"><strong>${selectedCorrect ? 'Correct' : 'Your answer'} ${selected}</strong>: ${escapeHtml(
-        explanationFor(question, selected),
-      )}</div>`,
-    );
-
-    if (!selectedCorrect && question.correctOption) {
-      lines.push(
-        `<div class="expl-item"><strong>Correct answer ${question.correctOption}</strong>: ${escapeHtml(
-          explanationFor(question, question.correctOption),
-        )}</div>`,
-      );
-    }
   }
 
   dom.explanation.innerHTML = `
@@ -480,9 +523,12 @@ function renderQuestion() {
     dom.submitAnswerBtn.disabled = true;
   }
 
+  const atLastQuestion = state.currentIndex === state.quiz.questions.length - 1;
   dom.prevBtn.disabled = state.currentIndex === 0;
-  dom.nextBtn.disabled = state.completed;
-  dom.nextBtn.textContent = state.currentIndex === state.quiz.questions.length - 1 ? 'Finish' : 'Next';
+  dom.nextBtn.disabled = atLastQuestion;
+  dom.nextBtn.textContent = 'Next';
+  dom.finishBtn.classList.toggle('hidden', state.completed);
+  dom.newTestBtn.classList.toggle('hidden', !(state.completed && atLastQuestion));
 }
 
 function renderProgress() {
@@ -562,9 +608,10 @@ function renderAll() {
   }
 
   dom.quizTitle.textContent = state.quiz.title || 'Generated Quiz';
+  renderQuestion();
+  syncClockState();
   updateClockDisplay();
   renderChips();
-  renderQuestion();
   renderPalette();
   renderProgress();
   renderSummary();
@@ -581,12 +628,207 @@ function completeQuiz(reason = '') {
   renderAll();
 }
 
+function resetToUploadScreen() {
+  stopClock();
+  state.quiz = null;
+  state.currentIndex = 0;
+  state.answers = {};
+  state.selections = {};
+  state.submittedTutor = {};
+  state.flagged = new Set();
+  state.struck = {};
+  state.completed = false;
+  state.completionReason = '';
+  state.processing = null;
+  state.secondsLeft = null;
+  state.elapsedSeconds = 0;
+
+  dom.documentInput.value = '';
+  dom.quizSection.classList.add('hidden');
+  dom.summary.classList.add('hidden');
+  dom.uploadSection.classList.remove('hidden');
+  setStatus('Upload a file to generate a new quiz.');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => resolve(blob), type, quality);
+  });
+}
+
+async function compressImageBytes(uint8Array, mimeType) {
+  const originalBlob = new Blob([uint8Array], { type: mimeType });
+  const objectUrl = URL.createObjectURL(originalBlob);
+
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Image decode failed.'));
+      img.src = objectUrl;
+    });
+
+    const maxDimension = 1700;
+    const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth || 1, image.naturalHeight || 1));
+    const width = Math.max(1, Math.round((image.naturalWidth || 1) * scale));
+    const height = Math.max(1, Math.round((image.naturalHeight || 1) * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      return null;
+    }
+
+    context.drawImage(image, 0, 0, width, height);
+
+    const primaryType = /image\/(jpeg|png|webp)/i.test(mimeType) ? mimeType : 'image/jpeg';
+    const quality = primaryType === 'image/png' ? undefined : 0.7;
+    const compressedBlob = await canvasToBlob(canvas, primaryType, quality);
+
+    if (!compressedBlob) {
+      return null;
+    }
+
+    return new Uint8Array(await compressedBlob.arrayBuffer());
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function compressDocxForUpload(file) {
+  if (typeof window.JSZip === 'undefined') {
+    throw new Error('Compression library unavailable in browser.');
+  }
+
+  const zip = await window.JSZip.loadAsync(await file.arrayBuffer());
+  const mediaEntries = Object.keys(zip.files).filter((entryName) =>
+    /^word\/media\/.+\.(jpe?g|png|webp)$/i.test(entryName),
+  );
+
+  if (!mediaEntries.length) {
+    return file;
+  }
+
+  let changed = false;
+
+  for (const entryName of mediaEntries) {
+    const entry = zip.file(entryName);
+    if (!entry) {
+      continue;
+    }
+
+    const original = await entry.async('uint8array');
+    if (original.length < 55 * 1024) {
+      continue;
+    }
+
+    let mimeType = 'image/jpeg';
+    if (/\.png$/i.test(entryName)) {
+      mimeType = 'image/png';
+    } else if (/\.webp$/i.test(entryName)) {
+      mimeType = 'image/webp';
+    }
+
+    let compressed = null;
+    try {
+      compressed = await compressImageBytes(original, mimeType);
+    } catch (error) {
+      compressed = null;
+    }
+
+    if (compressed && compressed.length > 0 && compressed.length < original.length) {
+      zip.file(entryName, compressed);
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    return file;
+  }
+
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 9 },
+  });
+
+  if (blob.size >= file.size) {
+    return file;
+  }
+
+  return new File([blob], file.name, {
+    type: file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    lastModified: Date.now(),
+  });
+}
+
+async function prepareUploadFile(rawFile) {
+  const ext = extensionOf(rawFile.name);
+  if (!ALLOWED_FILE_EXTENSIONS.includes(ext)) {
+    throw new Error(
+      `Unsupported file type "${ext || 'unknown'}". Use ${ALLOWED_FILE_EXTENSIONS.join(', ')}.`,
+    );
+  }
+
+  if (rawFile.size <= FRONTEND_SAFE_UPLOAD_BYTES) {
+    return {
+      file: rawFile,
+      note: '',
+    };
+  }
+
+  if (!canCompressDocx(rawFile)) {
+    throw new Error(
+      `File is too large (${formatFileSize(rawFile.size)}). Vercel accepts about ${formatFileSize(
+        VERCEL_HARD_REQUEST_LIMIT_BYTES,
+      )} total request size, so keep uploads under ${formatFileSize(SERVER_UPLOAD_LIMIT_BYTES)}.`,
+    );
+  }
+
+  setStatus(
+    `File is ${formatFileSize(rawFile.size)}. Compressing DOCX images to fit Vercel upload limits...`,
+  );
+
+  const compressed = await compressDocxForUpload(rawFile);
+
+  if (compressed.size > SERVER_UPLOAD_LIMIT_BYTES) {
+    throw new Error(
+      `File is still too large after compression (${formatFileSize(
+        compressed.size,
+      )}). Reduce embedded image sizes and retry.`,
+    );
+  }
+
+  return {
+    file: compressed,
+    note:
+      compressed.size < rawFile.size
+        ? `DOCX compressed from ${formatFileSize(rawFile.size)} to ${formatFileSize(compressed.size)} before upload.`
+        : '',
+  };
+}
+
 async function uploadDocument(event) {
   event.preventDefault();
 
-  const file = dom.documentInput.files?.[0];
-  if (!file) {
+  const selectedFile = dom.documentInput.files?.[0];
+  if (!selectedFile) {
     setStatus('Select a document first.', 'error');
+    return;
+  }
+
+  let uploadFile = selectedFile;
+  let uploadPrepNote = '';
+
+  try {
+    const prepared = await prepareUploadFile(selectedFile);
+    uploadFile = prepared.file;
+    uploadPrepNote = prepared.note;
+  } catch (error) {
+    setStatus(error.message || 'Unable to prepare upload file.', 'error');
     return;
   }
 
@@ -594,7 +836,7 @@ async function uploadDocument(event) {
   dom.uploadBtn.disabled = true;
 
   const formData = new FormData();
-  formData.append('document', file);
+  formData.append('document', uploadFile);
   formData.append('timedMode', dom.timedMode.checked ? 'true' : 'false');
   formData.append('tutorMode', dom.tutorMode.checked ? 'true' : 'false');
   formData.append('useGemini', dom.useGemini.checked ? 'true' : 'false');
@@ -611,6 +853,9 @@ async function uploadDocument(event) {
       try {
         body = JSON.parse(rawBody);
       } catch (error) {
+        if (/<!doctype html|<html/i.test(rawBody)) {
+          throw new Error('Server returned a non-JSON error page. Check deployment logs and retry.');
+        }
         throw new Error(rawBody.slice(0, 240));
       }
     }
@@ -633,6 +878,7 @@ async function uploadDocument(event) {
     state.timedMode = dom.timedMode.checked;
     state.tutorMode = dom.tutorMode.checked;
 
+    dom.uploadSection.classList.add('hidden');
     dom.quizSection.classList.remove('hidden');
     dom.summary.classList.add('hidden');
 
@@ -660,6 +906,10 @@ async function uploadDocument(event) {
       parts.push(`Timed block set to ${formatClock(state.quiz.questions.length * SECONDS_PER_QUESTION)}.`);
     }
 
+    if (uploadPrepNote) {
+      parts.push(uploadPrepNote);
+    }
+
     setStatus(parts.join(' '), 'success');
     renderAll();
   } catch (error) {
@@ -679,12 +929,11 @@ function goPrevious() {
 }
 
 function goNext() {
-  if (!state.quiz || state.completed) {
+  if (!state.quiz) {
     return;
   }
 
   if (state.currentIndex >= state.quiz.questions.length - 1) {
-    completeQuiz('manual');
     return;
   }
 
@@ -763,11 +1012,23 @@ function submitCurrentTutorAnswer() {
   renderAll();
 }
 
+function endBlock() {
+  if (!state.quiz || state.completed) {
+    return;
+  }
+  completeQuiz('manual');
+}
+
+function makeNewTest() {
+  resetToUploadScreen();
+}
+
 dom.uploadForm.addEventListener('submit', uploadDocument);
 dom.prevBtn.addEventListener('click', goPrevious);
 dom.nextBtn.addEventListener('click', goNext);
 dom.flagBtn.addEventListener('click', toggleFlag);
-dom.finishBtn.addEventListener('click', () => completeQuiz('manual'));
+dom.finishBtn.addEventListener('click', endBlock);
+dom.newTestBtn.addEventListener('click', makeNewTest);
 dom.submitAnswerBtn.addEventListener('click', submitCurrentTutorAnswer);
 dom.stem.addEventListener('mouseup', onStemMouseUp);
 dom.stem.addEventListener('touchend', onStemMouseUp, { passive: true });

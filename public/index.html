@@ -12,7 +12,8 @@
         <h1>NBME-Style Quiz Builder</h1>
         <p class="upload-subtitle">
           Upload <code>.pdf</code>, <code>.docx</code>, <code>.doc</code>, <code>.txt</code>, or <code>.md</code>.
-          Timed mode is automatically <strong>90 seconds per question</strong>.
+          Timed mode is automatically <strong>90 seconds per question</strong>. Vercel uploads are capped for
+          reliability (under about <strong>4 MB</strong> file payload).
         </p>
 
         <form id="upload-form" class="upload-form">
@@ -111,6 +112,7 @@
             <button id="prev-btn" class="nav-btn" type="button">Previous</button>
             <button id="next-btn" class="nav-btn" type="button">Next</button>
             <button id="finish-btn" class="nav-btn" type="button">End Block</button>
+            <button id="new-test-btn" class="nav-btn hidden" type="button">Make a new test</button>
           </div>
 
           <div class="bottom-right">
@@ -123,6 +125,7 @@
       <section id="summary" class="summary hidden"></section>
     </main>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
