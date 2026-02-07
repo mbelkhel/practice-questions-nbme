@@ -2,9 +2,15 @@ const SECONDS_PER_QUESTION = 90;
 const MB = 1024 * 1024;
 // Vercel Function request/response payload hard limit is 4.5MB.
 const VERCEL_HARD_REQUEST_LIMIT_BYTES = 4.5 * MB;
-const SERVER_UPLOAD_LIMIT_BYTES = 4 * MB;
-const FRONTEND_SAFE_UPLOAD_BYTES = 3.8 * MB;
+const SERVER_UPLOAD_LIMIT_BYTES = Math.floor(4.2 * MB);
+const FRONTEND_SAFE_UPLOAD_BYTES = Math.floor(4.0 * MB);
 const ALLOWED_FILE_EXTENSIONS = ['.pdf', '.docx', '.doc', '.txt', '.md'];
+const DOCX_COMPRESSION_PASSES = [
+  { label: 'light', maxDimension: 1500, quality: 0.72, minSourceBytes: 30 * 1024 },
+  { label: 'medium', maxDimension: 1100, quality: 0.58, minSourceBytes: 14 * 1024 },
+  { label: 'aggressive', maxDimension: 800, quality: 0.45, minSourceBytes: 1 },
+  { label: 'ultra', maxDimension: 560, quality: 0.35, minSourceBytes: 1 },
+];
 
 const dom = {
   uploadSection: document.getElementById('upload-section'),
@@ -528,7 +534,7 @@ function renderQuestion() {
   dom.nextBtn.disabled = atLastQuestion;
   dom.nextBtn.textContent = 'Next';
   dom.finishBtn.classList.toggle('hidden', state.completed);
-  dom.newTestBtn.classList.toggle('hidden', !(state.completed && atLastQuestion));
+  dom.newTestBtn.classList.toggle('hidden', !state.completed);
 }
 
 function renderProgress() {
@@ -657,7 +663,90 @@ function canvasToBlob(canvas, type, quality) {
   });
 }
 
-async function compressImageBytes(uint8Array, mimeType) {
+function docxImageMimeType(entryName) {
+  if (/\.png$/i.test(entryName)) {
+    return 'image/png';
+  }
+  if (/\.webp$/i.test(entryName)) {
+    return 'image/webp';
+  }
+  return 'image/jpeg';
+}
+
+function baseNameWithoutExtension(fileName) {
+  const name = String(fileName || 'document').trim();
+  const dot = name.lastIndexOf('.');
+  return (dot > 0 ? name.slice(0, dot) : name).replace(/[^\w.-]+/g, '_').slice(0, 90) || 'document';
+}
+
+function decodeXmlEntities(text) {
+  return String(text || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number.parseInt(code, 10) || 32));
+}
+
+function normalizeFallbackText(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function extractDocxTextFallbackFile(file) {
+  if (typeof window.JSZip === 'undefined') {
+    throw new Error('Compression library unavailable in browser.');
+  }
+
+  const zip = await window.JSZip.loadAsync(await file.arrayBuffer());
+  const xmlEntries = Object.keys(zip.files).filter((entryName) =>
+    /^word\/(?:document|header\d+|footer\d+|footnotes|endnotes)\.xml$/i.test(entryName),
+  );
+
+  if (!xmlEntries.length) {
+    throw new Error('Unable to read text from DOCX fallback.');
+  }
+
+  const chunks = [];
+
+  for (const entryName of xmlEntries) {
+    const entry = zip.file(entryName);
+    if (!entry) {
+      continue;
+    }
+
+    const xml = await entry.async('string');
+    const text = decodeXmlEntities(
+      xml
+        .replace(/<w:tab\/>/gi, '\t')
+        .replace(/<w:br[^>]*\/>/gi, '\n')
+        .replace(/<\/w:p>/gi, '\n')
+        .replace(/<\/w:tr>/gi, '\n')
+        .replace(/<[^>]+>/g, ''),
+    );
+
+    if (text.trim()) {
+      chunks.push(text);
+    }
+  }
+
+  const mergedText = normalizeFallbackText(chunks.join('\n\n'));
+  if (!mergedText) {
+    throw new Error('Could not extract text from DOCX fallback.');
+  }
+
+  return new File([mergedText], `${baseNameWithoutExtension(file.name)}-text-only.txt`, {
+    type: 'text/plain',
+    lastModified: Date.now(),
+  });
+}
+
+async function compressImageBytes(uint8Array, mimeType, options = {}) {
   const originalBlob = new Blob([uint8Array], { type: mimeType });
   const objectUrl = URL.createObjectURL(originalBlob);
 
@@ -669,7 +758,7 @@ async function compressImageBytes(uint8Array, mimeType) {
       img.src = objectUrl;
     });
 
-    const maxDimension = 1700;
+    const maxDimension = Math.max(120, Number(options.maxDimension) || 1500);
     const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth || 1, image.naturalHeight || 1));
     const width = Math.max(1, Math.round((image.naturalWidth || 1) * scale));
     const height = Math.max(1, Math.round((image.naturalHeight || 1) * scale));
@@ -685,7 +774,7 @@ async function compressImageBytes(uint8Array, mimeType) {
     context.drawImage(image, 0, 0, width, height);
 
     const primaryType = /image\/(jpeg|png|webp)/i.test(mimeType) ? mimeType : 'image/jpeg';
-    const quality = primaryType === 'image/png' ? undefined : 0.7;
+    const quality = primaryType === 'image/png' ? undefined : Number(options.quality) || 0.7;
     const compressedBlob = await canvasToBlob(canvas, primaryType, quality);
 
     if (!compressedBlob) {
@@ -698,7 +787,7 @@ async function compressImageBytes(uint8Array, mimeType) {
   }
 }
 
-async function compressDocxForUpload(file) {
+async function compressDocxForUpload(file, pass) {
   if (typeof window.JSZip === 'undefined') {
     throw new Error('Compression library unavailable in browser.');
   }
@@ -709,10 +798,15 @@ async function compressDocxForUpload(file) {
   );
 
   if (!mediaEntries.length) {
-    return file;
+    return {
+      file,
+      changed: false,
+      compressedImages: 0,
+    };
   }
 
   let changed = false;
+  let compressedImages = 0;
 
   for (const entryName of mediaEntries) {
     const entry = zip.file(entryName);
@@ -721,20 +815,14 @@ async function compressDocxForUpload(file) {
     }
 
     const original = await entry.async('uint8array');
-    if (original.length < 55 * 1024) {
+    if (original.length < (pass?.minSourceBytes || 1)) {
       continue;
     }
 
-    let mimeType = 'image/jpeg';
-    if (/\.png$/i.test(entryName)) {
-      mimeType = 'image/png';
-    } else if (/\.webp$/i.test(entryName)) {
-      mimeType = 'image/webp';
-    }
-
+    const mimeType = docxImageMimeType(entryName);
     let compressed = null;
     try {
-      compressed = await compressImageBytes(original, mimeType);
+      compressed = await compressImageBytes(original, mimeType, pass);
     } catch (error) {
       compressed = null;
     }
@@ -742,11 +830,16 @@ async function compressDocxForUpload(file) {
     if (compressed && compressed.length > 0 && compressed.length < original.length) {
       zip.file(entryName, compressed);
       changed = true;
+      compressedImages += 1;
     }
   }
 
   if (!changed) {
-    return file;
+    return {
+      file,
+      changed: false,
+      compressedImages: 0,
+    };
   }
 
   const blob = await zip.generateAsync({
@@ -756,13 +849,21 @@ async function compressDocxForUpload(file) {
   });
 
   if (blob.size >= file.size) {
-    return file;
+    return {
+      file,
+      changed: false,
+      compressedImages: 0,
+    };
   }
 
-  return new File([blob], file.name, {
-    type: file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    lastModified: Date.now(),
-  });
+  return {
+    file: new File([blob], file.name, {
+      type: file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      lastModified: Date.now(),
+    }),
+    changed: true,
+    compressedImages,
+  };
 }
 
 async function prepareUploadFile(rawFile) {
@@ -792,23 +893,48 @@ async function prepareUploadFile(rawFile) {
     `File is ${formatFileSize(rawFile.size)}. Compressing DOCX images to fit Vercel upload limits...`,
   );
 
-  const compressed = await compressDocxForUpload(rawFile);
+  let candidate = rawFile;
+  const notes = [];
 
-  if (compressed.size > SERVER_UPLOAD_LIMIT_BYTES) {
-    throw new Error(
-      `File is still too large after compression (${formatFileSize(
-        compressed.size,
-      )}). Reduce embedded image sizes and retry.`,
-    );
+  for (const pass of DOCX_COMPRESSION_PASSES) {
+    const result = await compressDocxForUpload(candidate, pass);
+    candidate = result.file;
+
+    if (result.changed) {
+      notes.push(
+        `${pass.label} compression pass adjusted ${result.compressedImages} image(s); file is now ${formatFileSize(candidate.size)}.`,
+      );
+    }
+
+    if (candidate.size <= SERVER_UPLOAD_LIMIT_BYTES) {
+      return {
+        file: candidate,
+        note: `DOCX compressed from ${formatFileSize(rawFile.size)} to ${formatFileSize(candidate.size)} before upload. ${notes.join(' ')}`.trim(),
+      };
+    }
   }
 
-  return {
-    file: compressed,
-    note:
-      compressed.size < rawFile.size
-        ? `DOCX compressed from ${formatFileSize(rawFile.size)} to ${formatFileSize(compressed.size)} before upload.`
-        : '',
-  };
+  setStatus(
+    `Compressed file is still ${formatFileSize(
+      candidate.size,
+    )}. Switching to text-only fallback to fit Vercel limits (images will be skipped).`,
+  );
+
+  const textFallback = await extractDocxTextFallbackFile(rawFile);
+  if (textFallback.size <= SERVER_UPLOAD_LIMIT_BYTES) {
+    return {
+      file: textFallback,
+      note: `The original DOCX remained too large for Vercel with embedded images. Uploaded a text-only fallback (${formatFileSize(
+        textFallback.size,
+      )}) so parsing can continue. Split the source into smaller docs if you need all images preserved.`,
+    };
+  }
+
+  throw new Error(
+    `File is still too large even after aggressive compression and text fallback. Size is ${formatFileSize(
+      rawFile.size,
+    )}. Split the file into multiple smaller documents and upload one at a time.`,
+  );
 }
 
 async function uploadDocument(event) {

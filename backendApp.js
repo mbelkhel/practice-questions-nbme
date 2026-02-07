@@ -16,7 +16,7 @@ const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 
 const runningOnVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV || process.env.NOW_REGION);
 const uploadDir = runningOnVercel ? path.join(os.tmpdir(), 'uploads') : path.join(__dirname, 'uploads');
-const maxUploadBytes = runningOnVercel ? 4 * 1024 * 1024 : 25 * 1024 * 1024;
+const maxUploadBytes = runningOnVercel ? Math.floor(4.2 * 1024 * 1024) : 25 * 1024 * 1024;
 fsSync.mkdirSync(uploadDir, { recursive: true });
 
 function toBool(value, defaultValue = false) {

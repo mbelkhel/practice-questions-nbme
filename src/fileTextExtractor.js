@@ -65,20 +65,25 @@ async function extractFromPdf(filePath) {
 
 async function extractFromDocx(filePath) {
   const mammoth = getMammoth();
-  const [rawResult, htmlResult] = await Promise.all([
-    mammoth.extractRawText({ path: filePath }),
-    mammoth.convertToHtml({
+  const rawResult = await mammoth.extractRawText({ path: filePath });
+  const rawText = normalizeWhitespace(rawResult.value || '');
+
+  let htmlText = '';
+  try {
+    const htmlResult = await mammoth.convertToHtml({
       path: filePath,
       convertImage: mammoth.images.inline((element) =>
         element.read('base64').then((imageBase64) => ({
           src: `data:${element.contentType};base64,${imageBase64}`,
         })),
       ),
-    }),
-  ]);
+    });
 
-  const rawText = normalizeWhitespace(rawResult.value || '');
-  const htmlText = htmlToTextWithImageMarkers(htmlResult.value || '');
+    htmlText = htmlToTextWithImageMarkers(htmlResult.value || '');
+  } catch (error) {
+    htmlText = '';
+  }
+
   const hasImageMarkers = /\[IMAGE:/i.test(htmlText);
 
   if (hasImageMarkers) {

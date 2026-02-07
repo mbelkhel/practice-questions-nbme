@@ -295,6 +295,25 @@ code {
   cursor: default;
 }
 
+.review-action-wrap {
+  margin-top: 10px;
+}
+
+.review-new-test-btn {
+  border: 1px solid #1f5f97;
+  border-radius: 4px;
+  background: #2a79b9;
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 700;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+.review-new-test-btn:hover {
+  background: #1f5f97;
+}
+
 .option-row {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) auto;
